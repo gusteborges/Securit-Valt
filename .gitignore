@@ -1,0 +1,59 @@
+.DS_Store
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+
+
+# ==========================================
+# 🔒 DADOS SENSÍVEIS DO PROJETO (CRÍTICO)
+# ==========================================
+# Nunca commitar o banco de dados com as senhas!
+meu_cofre.db
+meu_cofre.db-journal
+meu_cofre.db-wal
+meu_cofre.db-shm
+
+# ==========================================
+# 🌐 FRONTEND (Node.js & SvelteKit)
+# ==========================================
+node_modules/
+.svelte-kit/
+build/
+dist/
+
+# Logs do NPM
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Variáveis de Ambiente
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# 🦀 BACKEND (Rust & Tauri)
+# ==========================================
+# A pasta target é onde o Rust compila os arquivos pesados (.exe, etc)
+src-tauri/target/
+
+# Nota: O arquivo `src-tauri/Cargo.lock` NÃO deve estar no gitignore. 
+# É boa prática commitar o Cargo.lock em aplicações finais (binários).
+
+# ==========================================
+# 💻 EDITORES E SISTEMA OPERACIONAL
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
