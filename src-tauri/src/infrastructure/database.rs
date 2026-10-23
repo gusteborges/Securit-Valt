@@ -170,6 +170,28 @@ impl Database {
         Ok(())
     }
 
+    /// Lê o verificador de senha mestra. `None` em cofres criados antes do verificador.
+    pub fn get_password_check(conn: &Connection) -> Result<Option<Vec<u8>>> {
+        match conn.query_row(
+            "SELECT value FROM vault_config WHERE key = 'password_check'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(blob) => Ok(Some(blob)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Persiste o verificador de senha mestra (ver `crypto::make_password_check`).
+    pub fn store_password_check(conn: &Connection, blob: &[u8]) -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_config (key, value) VALUES ('password_check', ?1)",
+            params![blob],
+        )?;
+        Ok(())
+    }
+
     // ── Escrita ──────────────────────────────────────────────────────────────
 
     /// Encripta e salva uma entrada no cofre.

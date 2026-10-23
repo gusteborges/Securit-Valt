@@ -7,7 +7,9 @@ mod security;
 mod application;
 
 // 2. Importações
-use application::commands::{initialize_vault, unlock_vault, add_entry, list_entries};
+use application::commands::{
+    add_entry, initialize_vault, list_entries, lock_vault, unlock_vault, vault_status,
+};
 use security::vault_state::VaultState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -20,6 +22,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             initialize_vault,
             unlock_vault,
+            lock_vault,
+            vault_status,
             add_entry,
             list_entries,
         ])

@@ -101,3 +101,29 @@ pub fn decrypt(
 
     Ok(String::from_utf8(plaintext)?)
 }
+
+// ── Verificador de senha mestra ──────────────────────────────────────────────
+
+/// Texto conhecido cifrado na inicialização para validar a senha no desbloqueio.
+const PASSWORD_CHECK_PLAINTEXT: &str = "secure-vault:password-check";
+const NONCE_LEN: usize = 12;
+
+/// Gera o verificador: `nonce (12 bytes) || ciphertext`, cifrado com `key`.
+pub fn make_password_check(key: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let (ciphertext, nonce) = encrypt(PASSWORD_CHECK_PLAINTEXT, key)?;
+    let mut blob = nonce;
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Retorna `true` somente se `blob` foi gerado com a mesma `key`.
+pub fn verify_password_check(blob: &[u8], key: &[u8; 32]) -> bool {
+    if blob.len() <= NONCE_LEN {
+        return false;
+    }
+    let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
+    matches!(
+        decrypt(ciphertext, nonce, key),
+        Ok(plaintext) if plaintext == PASSWORD_CHECK_PLAINTEXT
+    )
+}
