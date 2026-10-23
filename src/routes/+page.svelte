@@ -1,15 +1,227 @@
 <script lang="ts">
   import "../routes/app.css"; 
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
 
-  let activeTab = "cofre";
-
-  // Função placeholder para quando clicarmos no botão
-  function novoItem() {
-    alert("Em breve: Modal para adicionar senha!");
+  interface VaultEntry {
+    id: string;
+    domain: string;
+    username: string;
+    password: string;
+    created_at: string;
   }
+
+  interface VaultStatus {
+    initialized: boolean;
+    unlocked: boolean;
+  }
+
+  const MIN_PASSWORD_LEN = 8;
+
+  let status: "loading" | "setup" | "locked" | "unlocked" = "loading";
+  let activeTab = "cofre";
+  let entries: VaultEntry[] = [];
+  let listError = "";
+
+  // Telas de criação e desbloqueio
+  let masterPassword = "";
+  let confirmPassword = "";
+  let authError = "";
+  let authBusy = false;
+
+  // Modal "Novo Item"
+  let modalOpen = false;
+  let newDomain = "";
+  let newUsername = "";
+  let newPassword = "";
+  let modalError = "";
+  let modalBusy = false;
+
+  function errorMessage(e: unknown): string {
+    if (typeof e === "string") return e;
+    return e instanceof Error ? e.message : String(e);
+  }
+
+  async function checkStatus() {
+    try {
+      const s = await invoke<VaultStatus>("vault_status");
+      if (!s.initialized) {
+        status = "setup";
+      } else if (s.unlocked) {
+        await enterVault();
+      } else {
+        status = "locked";
+      }
+    } catch (e) {
+      authError = errorMessage(e);
+      status = "locked";
+    }
+  }
+
+  async function enterVault() {
+    masterPassword = "";
+    confirmPassword = "";
+    authError = "";
+    status = "unlocked";
+    await loadEntries();
+  }
+
+  async function loadEntries() {
+    listError = "";
+    try {
+      entries = await invoke<VaultEntry[]>("list_entries");
+    } catch (e) {
+      listError = errorMessage(e);
+    }
+  }
+
+  async function initializeVault() {
+    authError = "";
+    if (masterPassword.length < MIN_PASSWORD_LEN) {
+      authError = `A senha mestra deve ter pelo menos ${MIN_PASSWORD_LEN} caracteres.`;
+      return;
+    }
+    if (masterPassword !== confirmPassword) {
+      authError = "As senhas não coincidem.";
+      return;
+    }
+
+    authBusy = true;
+    try {
+      await invoke("initialize_vault", { password: masterPassword });
+      await enterVault();
+    } catch (e) {
+      authError = errorMessage(e);
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function unlockVault() {
+    authError = "";
+    authBusy = true;
+    try {
+      await invoke("unlock_vault", { password: masterPassword });
+      await enterVault();
+    } catch (e) {
+      authError = errorMessage(e);
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function lockVault() {
+    try {
+      await invoke("lock_vault");
+    } catch (e) {
+      listError = errorMessage(e);
+      return;
+    }
+    entries = [];
+    modalOpen = false;
+    masterPassword = "";
+    confirmPassword = "";
+    authError = "";
+    status = "locked";
+  }
+
+  function novoItem() {
+    newDomain = "";
+    newUsername = "";
+    newPassword = "";
+    modalError = "";
+    modalOpen = true;
+  }
+
+  function fecharModal() {
+    modalOpen = false;
+    newPassword = "";
+  }
+
+  async function salvarItem() {
+    modalError = "";
+    if (!newDomain.trim() || !newPassword) {
+      modalError = "Domínio e senha são obrigatórios.";
+      return;
+    }
+
+    modalBusy = true;
+    try {
+      await invoke("add_entry", {
+        domain: newDomain.trim(),
+        username: newUsername.trim(),
+        password: newPassword,
+      });
+      fecharModal();
+      await loadEntries();
+    } catch (e) {
+      modalError = errorMessage(e);
+    } finally {
+      modalBusy = false;
+    }
+  }
+
+  onMount(() => {
+    checkStatus();
+  });
 </script>
 
+{#if status === "loading"}
+<main class="flex h-screen w-screen bg-bg text-gray-400 items-center justify-center font-sans">
+  <p class="text-sm">Carregando cofre...</p>
+</main>
+{:else if status === "setup" || status === "locked"}
+<main class="flex h-screen w-screen bg-bg text-gray-100 items-center justify-center font-sans">
+  <form
+    class="w-full max-w-sm bg-surface p-8 rounded-xl border border-gray-800 space-y-4"
+    on:submit|preventDefault={status === "setup" ? initializeVault : unlockVault}
+  >
+    <div class="text-center">
+      <h1 class="text-2xl font-bold tracking-tight text-primary">SecureVault 🔒</h1>
+      <p class="text-xs text-gray-500 mt-1">
+        {status === "setup"
+          ? "Crie a senha mestra do seu cofre"
+          : "Digite a senha mestra para desbloquear"}
+      </p>
+    </div>
+
+    <input
+      type="password"
+      bind:value={masterPassword}
+      placeholder="Senha mestra"
+      autocomplete="off"
+      required
+      class="w-full bg-bg border border-gray-700 text-sm rounded-lg py-2 px-3 focus:outline-none focus:border-primary text-gray-200 placeholder-gray-600"
+    />
+
+    {#if status === "setup"}
+      <input
+        type="password"
+        bind:value={confirmPassword}
+        placeholder="Confirmar senha mestra"
+        autocomplete="off"
+        required
+        class="w-full bg-bg border border-gray-700 text-sm rounded-lg py-2 px-3 focus:outline-none focus:border-primary text-gray-200 placeholder-gray-600"
+      />
+      <p class="text-xs text-gray-500">
+        Mínimo de {MIN_PASSWORD_LEN} caracteres. Essa senha não pode ser recuperada.
+      </p>
+    {/if}
+
+    {#if authError}
+      <p class="text-sm text-danger">{authError}</p>
+    {/if}
+
+    <button
+      type="submit"
+      disabled={authBusy}
+      class="w-full bg-primary hover:bg-primary/90 disabled:opacity-50 text-bg font-bold py-2 rounded-lg text-sm transition-transform active:scale-95"
+    >
+      {status === "setup" ? "Criar cofre" : "Desbloquear"}
+    </button>
+  </form>
+</main>
+{:else}
 <main class="flex h-screen w-screen bg-bg text-gray-100 overflow-hidden font-sans">
   
   <aside class="w-64 bg-surface flex flex-col border-r border-gray-800">
@@ -45,7 +257,10 @@
     </nav>
 
     <div class="p-4 border-t border-gray-800">
-      <button class="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-500 hover:text-danger transition-colors">
+      <button
+        on:click={lockVault}
+        class="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-500 hover:text-danger transition-colors"
+      >
         <span>🚪</span> Bloquear Cofre
       </button>
     </div>
@@ -74,38 +289,95 @@
     <div class="flex-1 overflow-y-auto p-8">
       <div class="flex items-center justify-between mb-6">
         <h2 class="text-xl font-semibold text-white">Todas as Senhas</h2>
-        <span class="text-xs text-gray-500 bg-surface px-2 py-1 rounded-md border border-gray-700">3 itens</span>
+        <span class="text-xs text-gray-500 bg-surface px-2 py-1 rounded-md border border-gray-700">{entries.length} {entries.length === 1 ? "item" : "itens"}</span>
       </div>
-      
+
+      {#if listError}
+        <p class="text-sm text-danger mb-4">{listError}</p>
+      {/if}
+
+      {#if entries.length === 0}
+        <div class="text-center text-gray-500 text-sm py-16 border border-dashed border-gray-800 rounded-xl">
+          Nenhuma senha cadastrada ainda. Clique em "Novo Item" para começar.
+        </div>
+      {:else}
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        
-        <div class="bg-surface p-4 rounded-xl border border-gray-800 hover:border-primary/50 cursor-pointer transition-all hover:shadow-lg hover:shadow-black/40 group relative">
-          <div class="flex justify-between mb-4">
-            <div class="w-10 h-10 rounded-full bg-white flex items-center justify-center text-xl font-bold text-gray-800">
-              G
+        {#each entries as entry (entry.id)}
+          <div class="bg-surface p-4 rounded-xl border border-gray-800 hover:border-primary/50 transition-all hover:shadow-lg hover:shadow-black/40">
+            <div class="w-10 h-10 mb-4 rounded-full bg-primary/20 flex items-center justify-center text-xl font-bold text-primary uppercase">
+              {entry.domain.charAt(0)}
             </div>
-            <button class="text-gray-500 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity" title="Copiar Senha">
-              📋
-            </button>
+            <h3 class="font-bold text-gray-200 text-lg truncate" title={entry.domain}>{entry.domain}</h3>
+            <p class="text-xs text-gray-400 mt-1 truncate">{entry.username || "Sem usuário"}</p>
           </div>
-          <h3 class="font-bold text-gray-200 text-lg">Google</h3>
-          <p class="text-xs text-gray-400 mt-1">meu.email@gmail.com</p>
-        </div>
-
-        <div class="bg-surface p-4 rounded-xl border border-gray-800 hover:border-primary/50 cursor-pointer transition-all hover:shadow-lg hover:shadow-black/40 group relative">
-          <div class="flex justify-between mb-4">
-            <div class="w-10 h-10 rounded-full bg-[#1877F2] flex items-center justify-center text-xl font-bold text-white">
-              f
-            </div>
-            <button class="text-gray-500 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity">
-              📋
-            </button>
-          </div>
-          <h3 class="font-bold text-gray-200 text-lg">Facebook</h3>
-          <p class="text-xs text-gray-400 mt-1">social@meta.com</p>
-        </div>
-
+        {/each}
       </div>
+      {/if}
     </div>
   </div>
+
+  {#if modalOpen}
+  <div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+    <form
+      class="w-full max-w-md bg-surface p-6 rounded-xl border border-gray-800 space-y-4"
+      on:submit|preventDefault={salvarItem}
+    >
+      <h2 class="text-lg font-semibold text-white">Novo Item</h2>
+
+      <label class="block space-y-1">
+        <span class="text-xs text-gray-400">Domínio *</span>
+        <input
+          type="text"
+          bind:value={newDomain}
+          placeholder="exemplo.com"
+          required
+          class="w-full bg-bg border border-gray-700 text-sm rounded-lg py-2 px-3 focus:outline-none focus:border-primary text-gray-200 placeholder-gray-600"
+        />
+      </label>
+
+      <label class="block space-y-1">
+        <span class="text-xs text-gray-400">Usuário</span>
+        <input
+          type="text"
+          bind:value={newUsername}
+          placeholder="meu.email@exemplo.com"
+          class="w-full bg-bg border border-gray-700 text-sm rounded-lg py-2 px-3 focus:outline-none focus:border-primary text-gray-200 placeholder-gray-600"
+        />
+      </label>
+
+      <label class="block space-y-1">
+        <span class="text-xs text-gray-400">Senha *</span>
+        <input
+          type="password"
+          bind:value={newPassword}
+          autocomplete="new-password"
+          required
+          class="w-full bg-bg border border-gray-700 text-sm rounded-lg py-2 px-3 focus:outline-none focus:border-primary text-gray-200 placeholder-gray-600"
+        />
+      </label>
+
+      {#if modalError}
+        <p class="text-sm text-danger">{modalError}</p>
+      {/if}
+
+      <div class="flex justify-end gap-3 pt-2">
+        <button
+          type="button"
+          on:click={fecharModal}
+          class="py-2 px-4 rounded-lg text-sm text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
+        >
+          Cancelar
+        </button>
+        <button
+          type="submit"
+          disabled={modalBusy}
+          class="bg-primary hover:bg-primary/90 disabled:opacity-50 text-bg font-bold py-2 px-4 rounded-lg text-sm transition-transform active:scale-95"
+        >
+          Salvar
+        </button>
+      </div>
+    </form>
+  </div>
+  {/if}
 </main>
+{/if}
