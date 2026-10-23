@@ -3,7 +3,7 @@
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
 use crate::domain::models::VaultEntry;
-use crate::security::crypto::encrypt; 
+use crate::security::crypto::{decrypt, encrypt, ARGON2_SALT_LEN};
 
 pub struct Database {
     path: String,
@@ -18,80 +18,268 @@ impl Database {
 
     pub fn open_connection(&self) -> Result<Connection> {
         let conn = Connection::open(&self.path)?;
-        
-        // O execute_batch ignora os retornos, resolvendo o erro do "journal_mode"
+
         conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA foreign_keys = ON;"
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;",
         )?;
-        
+
         Ok(conn)
     }
 
-    // --- MIGRATION SYSTEM (A parte Inteligente) ---
+    // ── Sistema de Migrações ─────────────────────────────────────────────────
+
+    /// Aplica todas as migrações pendentes de forma idempotente.
+    /// Usa `PRAGMA user_version` como número de versão do schema.
     pub fn setup_schema(conn: &Connection) -> Result<()> {
-        // 1. Verifica a versão atual do banco
-        let current_version: i32 = conn.query_row(
-            "PRAGMA user_version",
-            [],
-            |row| row.get(0)
-        )?;
+        let current_version: i32 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
-        // 2. Se for menor que 1, aplica a criação inicial
+        // Migration v1 — tabela inicial vault_entries (schema legado, sem nonce_username)
+        // Só aplicada se o banco já existia com user_version = 0 e a tabela foi criada
+        // manualmente fora do sistema de migrações. Bancos novos pulam direto para v2.
         if current_version < 1 {
-            println!("🔄 Aplicando Migration v1: Criando tabelas iniciais...");
-            
-            conn.execute(
+            println!("🔄 Aplicando Migration v1: Criando tabelas iniciais (schema legado)...");
+
+            // Cria com o schema legado somente se a tabela ainda não existir
+            // (bancos novos serão criados diretamente com o schema v2 abaixo)
+            conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS vault_entries (
-                    id TEXT PRIMARY KEY,
-                    domain TEXT NOT NULL,
-                    username_encrypted BLOB, -- BLOB para guardar bytes criptografados
+                    id                 TEXT PRIMARY KEY,
+                    domain             TEXT NOT NULL,
+                    username_encrypted BLOB,
                     password_encrypted BLOB NOT NULL,
-                    nonce BLOB NOT NULL,     -- O 'sal' aleatório usado na encriptação
-                    created_at TEXT NOT NULL
-                )",
-                [],
+                    nonce              BLOB NOT NULL,
+                    created_at         TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_domain ON vault_entries (domain);",
             )?;
 
-            // Cria índice para busca rápida por site (ex: google.com)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_domain ON vault_entries (domain)",
-                [],
-            )?;
-
-            // Atualiza a versão para não rodar isso de novo
-            conn.execute("PRAGMA user_version = 1", [])?;
+            conn.execute_batch("PRAGMA user_version = 1")?;
             println!("✅ Migration v1 concluída.");
+        }
+
+        // Migration v2 — vault_config (salt Argon2) + schema vault_entries correto
+        if current_version < 2 {
+            println!("🔄 Aplicando Migration v2: vault_config + nonce_username...");
+
+            // Tabela de configuração do cofre (salt Argon2, versão de schema, etc.)
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vault_config (
+                    key   TEXT PRIMARY KEY,
+                    value BLOB NOT NULL
+                );",
+            )?;
+
+            // Verifica se vault_entries já existe (banco legado com coluna 'nonce')
+            let old_col_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('vault_entries')
+                     WHERE name = 'nonce'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+
+            if old_col_exists {
+                // Banco legado: renomeia 'nonce' → 'nonce_password' e adiciona 'nonce_username'
+                // via reconstrução de tabela (SQLite não tem RENAME COLUMN antes de 3.25)
+                conn.execute_batch(
+                    "BEGIN;
+                     CREATE TABLE vault_entries_new (
+                         id                 TEXT PRIMARY KEY,
+                         domain             TEXT NOT NULL,
+                         username_encrypted BLOB,
+                         nonce_username     BLOB,
+                         password_encrypted BLOB NOT NULL,
+                         nonce_password     BLOB NOT NULL,
+                         created_at         TEXT NOT NULL
+                     );
+                     INSERT INTO vault_entries_new
+                         SELECT id, domain, username_encrypted, NULL,
+                                password_encrypted, nonce AS nonce_password, created_at
+                         FROM vault_entries;
+                     DROP TABLE vault_entries;
+                     ALTER TABLE vault_entries_new RENAME TO vault_entries;
+                     CREATE INDEX IF NOT EXISTS idx_domain ON vault_entries (domain);
+                     COMMIT;",
+                )?;
+            } else {
+                // Banco novo (nunca teve v1 ou tabela ainda não existe): cria com schema correto
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS vault_entries (
+                         id                 TEXT PRIMARY KEY,
+                         domain             TEXT NOT NULL,
+                         username_encrypted BLOB,
+                         nonce_username     BLOB,
+                         password_encrypted BLOB NOT NULL,
+                         nonce_password     BLOB NOT NULL,
+                         created_at         TEXT NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_domain ON vault_entries (domain);",
+                )?;
+            }
+
+            conn.execute_batch("PRAGMA user_version = 2")?;
+            println!("✅ Migration v2 concluída.");
         }
 
         Ok(())
     }
 
-    pub fn insert_entry(&self, entry: &VaultEntry, master_key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
+    // ── Persistência do Salt Argon2 ──────────────────────────────────────────
+
+    /// Lê o salt Argon2 do banco. Retorna `None` se o cofre nunca foi inicializado.
+    pub fn get_argon2_salt(
+        conn: &Connection,
+    ) -> Result<Option<[u8; ARGON2_SALT_LEN]>> {
+        let result = conn.query_row(
+            "SELECT value FROM vault_config WHERE key = 'argon2_salt'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+
+        match result {
+            Ok(bytes) => {
+                let arr: [u8; ARGON2_SALT_LEN] = bytes
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::InvalidColumnType(
+                        0,
+                        "argon2_salt".into(),
+                        rusqlite::types::Type::Blob,
+                    ))?;
+                Ok(Some(arr))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Persiste o salt Argon2 gerado na inicialização do cofre.
+    /// Deve ser chamado somente uma vez — `initialize_vault` garante isso.
+    pub fn store_argon2_salt(
+        conn: &Connection,
+        salt: &[u8; ARGON2_SALT_LEN],
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO vault_config (key, value) VALUES ('argon2_salt', ?1)",
+            params![salt.as_ref()],
+        )?;
+        Ok(())
+    }
+
+    // ── Escrita ──────────────────────────────────────────────────────────────
+
+    /// Encripta e salva uma entrada no cofre.
+    ///
+    /// Cada campo (username, password) recebe seu próprio nonce aleatório.
+    /// Ambos os nonces são persistidos — correção do bug original que descartava
+    /// o nonce do username (`_nonce_user`).
+    pub fn insert_entry(
+        &self,
+        entry: &VaultEntry,
+        master_key: &[u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.open_connection()?;
 
-        // 1. Encripta a SENHA
-        // Retorna 
-        let (enc_password, nonce_pass) = encrypt(&entry.password, master_key)?;
-        
-        // 2. Encripta o USUÁRIO 
-        let (enc_username, _nonce_user) = encrypt(&entry.username, master_key)?;
+        // Cada campo usa um nonce independente — reutilização de nonce com a
+        // mesma chave em GCM quebra a confidencialidade de ambos os registros.
+        let (enc_password, nonce_password) = encrypt(&entry.password, master_key)?;
+        let (enc_username, nonce_username) = encrypt(&entry.username, master_key)?;
 
-        // 3. Salva no SQLite
         conn.execute(
-            "INSERT INTO vault_entries (id, domain, username_encrypted, password_encrypted, nonce, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO vault_entries
+             (id, domain, username_encrypted, nonce_username,
+              password_encrypted, nonce_password, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 entry.id,
                 entry.domain,
-                enc_username, 
-                enc_password, 
-                nonce_pass,   // Importante: nonce para ler a senha depois
+                enc_username,
+                nonce_username,   // antes descartado como `_nonce_user` — agora persistido
+                enc_password,
+                nonce_password,
                 entry.created_at.to_rfc3339()
             ],
         )?;
 
         Ok(())
+    }
+
+    // ── Leitura ──────────────────────────────────────────────────────────────
+
+    /// Lê e decripta todas as entradas do cofre.
+    ///
+    /// Entradas legadas (migradas da v1) com `nonce_username = NULL` retornam
+    /// o campo username como `"[indisponível — registro legado]"` em vez de
+    /// falhar e bloquear acesso a todos os dados.
+    pub fn get_all_entries(
+        &self,
+        master_key: &[u8; 32],
+    ) -> Result<Vec<VaultEntry>, Box<dyn std::error::Error>> {
+        let conn = self.open_connection()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, domain,
+                    username_encrypted, nonce_username,
+                    password_encrypted, nonce_password,
+                    created_at
+             FROM vault_entries
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,        // id
+                row.get::<_, String>(1)?,        // domain
+                row.get::<_, Option<Vec<u8>>>(2)?, // username_encrypted
+                row.get::<_, Option<Vec<u8>>>(3)?, // nonce_username
+                row.get::<_, Vec<u8>>(4)?,       // password_encrypted
+                row.get::<_, Vec<u8>>(5)?,       // nonce_password
+                row.get::<_, String>(6)?,        // created_at
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+
+        for raw in rows {
+            let (id, domain, enc_username, nonce_username,
+                 enc_password, nonce_password, created_at_str) = raw?;
+
+            // Decripta a senha — falha explícita em caso de chave errada ou corrupção
+            let password = decrypt(&enc_password, &nonce_password, master_key)
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("Erro ao decriptar senha do registro '{id}': {e}").into()
+                })?;
+
+            // Decripta o username — degradação graciosa para registros legados
+            let username = match (enc_username, nonce_username) {
+                (Some(enc), Some(nonce)) => {
+                    decrypt(&enc, &nonce, master_key)
+                        .map_err(|e| -> Box<dyn std::error::Error> {
+                            format!("Erro ao decriptar username do registro '{id}': {e}").into()
+                        })?
+                }
+                _ => "[indisponível — registro legado]".to_string(),
+            };
+
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("Data inválida no registro '{id}': {e}").into()
+                })?
+                .with_timezone(&chrono::Utc);
+
+            entries.push(VaultEntry {
+                id,
+                domain,
+                username,
+                password,
+                created_at,
+            });
+        }
+
+        Ok(entries)
     }
 }
