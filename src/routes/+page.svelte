@@ -7,7 +7,6 @@
     id: string;
     domain: string;
     username: string;
-    password: string;
     created_at: string;
   }
 
@@ -155,11 +154,19 @@
     modalOpen = true;
   }
 
-  function editarItem(entry: VaultEntry) {
+  async function editarItem(entry: VaultEntry) {
+    listError = "";
+    let senha: string;
+    try {
+      senha = await invoke<string>("get_password", { id: entry.id });
+    } catch (e) {
+      listError = errorMessage(e);
+      return;
+    }
     editingId = entry.id;
     newDomain = entry.domain;
     newUsername = entry.username === LEGACY_USERNAME ? "" : entry.username;
-    newPassword = entry.password;
+    newPassword = senha;
     modalError = "";
     modalOpen = true;
   }
@@ -179,13 +186,15 @@
   }
 
   async function copiarSenha(entry: VaultEntry) {
+    let senha: string;
     try {
-      await navigator.clipboard.writeText(entry.password);
+      senha = await invoke<string>("get_password", { id: entry.id });
+      await navigator.clipboard.writeText(senha);
     } catch {
       clipboardNotice = "Não foi possível copiar a senha.";
       return;
     }
-    clipboardValue = entry.password;
+    clipboardValue = senha;
     clipboardNotice = `Senha de ${entry.domain} copiada. A área de transferência será limpa em 30 segundos.`;
     if (clipboardTimer) clearTimeout(clipboardTimer);
     clipboardTimer = setTimeout(limparClipboard, CLIPBOARD_CLEAR_MS);

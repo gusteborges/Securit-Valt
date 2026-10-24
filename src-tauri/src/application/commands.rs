@@ -1,4 +1,5 @@
 use tauri::{AppHandle, Manager, State};
+use rusqlite::Connection;
 use crate::domain::models::VaultEntry;
 use crate::infrastructure::database::Database;
 use crate::security::{
@@ -49,12 +50,35 @@ fn validate_master_password(password: &str) -> Result<(), String> {
 
 // ── Comando 1: initialize_vault ──────────────────────────────────────────────
 
+/// Um cofre está inicializado quando há salt e (verificador ou entradas).
+///
+/// Salt sem verificador e sem entradas é o resto de um cofre legado vazio: não
+/// guarda dados, então é tratado como não inicializado e recriado com a senha
+/// escolhida no setup, em vez de aceitar a primeira senha digitada no desbloqueio.
+fn vault_is_initialized(conn: &Connection) -> Result<bool, String> {
+    let has_salt = Database::get_argon2_salt(conn)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !has_salt {
+        return Ok(false);
+    }
+
+    let has_check = Database::get_password_check(conn)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if has_check {
+        return Ok(true);
+    }
+
+    Database::has_entries(conn).map_err(|e| e.to_string())
+}
+
 /// Inicialização do cofre (primeira execução).
 ///
 /// Gera um salt Argon2 aleatório, deriva a chave mestra a partir da senha
 /// fornecida, persiste o salt no banco e mantém a chave em memória.
 ///
-/// Retorna erro se o cofre já foi inicializado (salt já existe no banco).
+/// Retorna erro se o cofre já foi inicializado.
 #[tauri::command]
 pub fn initialize_vault(
     password: String,
@@ -76,11 +100,9 @@ fn initialize_vault_with(
 
     Database::setup_schema(&conn).map_err(|e| e.to_string())?;
 
-    // Impede dupla inicialização
-    if Database::get_argon2_salt(&conn)
-        .map_err(|e| e.to_string())?
-        .is_some()
-    {
+    // Impede dupla inicialização e nunca recria sobre entradas existentes
+    let has_entries = Database::has_entries(&conn).map_err(|e| e.to_string())?;
+    if vault_is_initialized(&conn)? || has_entries {
         return Err(
             "Cofre já inicializado. Use unlock_vault para desbloquear.".into(),
         );
@@ -93,6 +115,7 @@ fn initialize_vault_with(
     let check = make_password_check(&key_bytes).map_err(|e| e.to_string())?;
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    Database::clear_vault_config(&tx).map_err(|e| e.to_string())?;
     Database::store_argon2_salt(&tx, &salt).map_err(|e| e.to_string())?;
     Database::store_password_check(&tx, &check).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -116,7 +139,9 @@ fn initialize_vault_with(
 ///
 /// Se a senha estiver errada, o verificador não confere e a chave NÃO é guardada.
 /// Cofres criados antes do verificador são validados tentando decriptar as
-/// entradas existentes; se o cofre estiver vazio, o verificador é criado agora.
+/// entradas existentes; nesse caso o verificador é gravado. Um cofre sem
+/// verificador e sem entradas não é desbloqueável: deve ser recriado por
+/// `initialize_vault`.
 #[tauri::command]
 pub fn unlock_vault(
     password: String,
@@ -135,6 +160,10 @@ fn unlock_vault_with(
     let conn = db.open_connection().map_err(|e| e.to_string())?;
 
     Database::setup_schema(&conn).map_err(|e| e.to_string())?;
+
+    if !vault_is_initialized(&conn)? {
+        return Err("Cofre não inicializado. Execute initialize_vault primeiro.".into());
+    }
 
     let salt = Database::get_argon2_salt(&conn)
         .map_err(|e| e.to_string())?
@@ -203,14 +232,15 @@ fn add_entry_with(
 
 // ── Comando 4: list_entries ──────────────────────────────────────────────────
 
-/// Retorna todas as entradas do cofre decriptadas.
+/// Retorna os metadados de todas as entradas (sem senha).
 ///
+/// As senhas não trafegam nesta listagem: use `get_password` sob demanda.
 /// Requer que o cofre esteja desbloqueado.
 #[tauri::command]
 pub fn list_entries(
     app: AppHandle,
     state: State<VaultState>,
-) -> Result<Vec<VaultEntryResponse>, String> {
+) -> Result<Vec<VaultEntrySummary>, String> {
     let db = get_db(&app)?;
     list_entries_with(&db, &state)
 }
@@ -218,14 +248,37 @@ pub fn list_entries(
 fn list_entries_with(
     db: &Database,
     state: &VaultState,
-) -> Result<Vec<VaultEntryResponse>, String> {
+) -> Result<Vec<VaultEntrySummary>, String> {
     let key_bytes = session_key(state)?;
 
     let entries = db
         .get_all_entries(&key_bytes)
         .map_err(|e| e.to_string())?;
 
-    Ok(entries.into_iter().map(VaultEntryResponse::from).collect())
+    Ok(entries.into_iter().map(VaultEntrySummary::from).collect())
+}
+
+// ── Comando 4b: get_password ─────────────────────────────────────────────────
+
+/// Retorna a senha de uma entrada, decriptada sob demanda.
+///
+/// Requer que o cofre esteja desbloqueado.
+#[tauri::command]
+pub fn get_password(
+    id: String,
+    app: AppHandle,
+    state: State<VaultState>,
+) -> Result<String, String> {
+    let db = get_db(&app)?;
+    get_password_with(&db, &state, &id)
+}
+
+fn get_password_with(db: &Database, state: &VaultState, id: &str) -> Result<String, String> {
+    let key_bytes = session_key(state)?;
+
+    db.get_entry_password(id, &key_bytes)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Entrada não encontrada.".to_string())
 }
 
 // ── Comando 5: lock_vault ────────────────────────────────────────────────────
@@ -321,9 +374,7 @@ fn vault_status_with(db: &Database, state: &VaultState) -> Result<VaultStatus, S
 
     Database::setup_schema(&conn).map_err(|e| e.to_string())?;
 
-    let initialized = Database::get_argon2_salt(&conn)
-        .map_err(|e| e.to_string())?
-        .is_some();
+    let initialized = vault_is_initialized(&conn)?;
 
     Ok(VaultStatus {
         initialized,
@@ -339,26 +390,25 @@ pub struct VaultStatus {
 
 // ── DTO de resposta (serializável pelo Tauri) ────────────────────────────────
 
-/// Estrutura de resposta retornada pelo comando `list_entries`.
+/// Metadados de uma entrada, retornados por `list_entries`. A senha não faz parte
+/// deste DTO: ela é obtida com `get_password`.
 ///
 /// Separada do modelo de domínio `VaultEntry` para evitar expor
 /// campos internos via IPC e ter controle fino sobre serialização.
 #[derive(serde::Serialize)]
-pub struct VaultEntryResponse {
+pub struct VaultEntrySummary {
     pub id: String,
     pub domain: String,
     pub username: String,
-    pub password: String,
     pub created_at: String, // ISO 8601
 }
 
-impl From<VaultEntry> for VaultEntryResponse {
+impl From<VaultEntry> for VaultEntrySummary {
     fn from(e: VaultEntry) -> Self {
         Self {
             id: e.id,
             domain: e.domain,
             username: e.username,
-            password: e.password,
             created_at: e.created_at.to_rfc3339(),
         }
     }
@@ -499,11 +549,17 @@ mod tests {
 
         let github = entries.iter().find(|e| e.domain == "github.com").unwrap();
         assert_eq!(github.username, "ana");
-        assert_eq!(github.password, "senha-gh-1");
+        assert_eq!(
+            get_password_with(&f.db, &f.state, &github.id).unwrap(),
+            "senha-gh-1"
+        );
 
         let mail = entries.iter().find(|e| e.domain == "mail.com").unwrap();
         assert_eq!(mail.username, "ana@mail.com");
-        assert_eq!(mail.password, "senha-mail-2");
+        assert_eq!(
+            get_password_with(&f.db, &f.state, &mail.id).unwrap(),
+            "senha-mail-2"
+        );
     }
 
     #[test]
@@ -532,8 +588,76 @@ mod tests {
         assert_eq!(list_entries_with(&f.db, &f.state).unwrap().len(), 1);
     }
 
-    fn first_entry(f: &Fixture) -> VaultEntryResponse {
+    fn first_entry(f: &Fixture) -> VaultEntrySummary {
         list_entries_with(&f.db, &f.state).unwrap().remove(0)
+    }
+
+    fn password_of(f: &Fixture, id: &str) -> String {
+        get_password_with(&f.db, &f.state, id).unwrap()
+    }
+
+    #[test]
+    fn legado_vazio_sem_verificador_nao_esta_inicializado() {
+        let f = initialized_fixture();
+        lock_vault_with(&f.state).unwrap();
+        remove_password_check(&f.db);
+
+        assert!(!vault_status_with(&f.db, &f.state).unwrap().initialized);
+        assert!(unlock_vault_with(&f.db, &f.state, PASSWORD).is_err());
+    }
+
+    #[test]
+    fn legado_vazio_pode_ser_recriado_com_senha_confirmada() {
+        let f = initialized_fixture();
+        lock_vault_with(&f.state).unwrap();
+        remove_password_check(&f.db);
+
+        initialize_vault_with(&f.db, &f.state, "nova-senha-789").unwrap();
+        lock_vault_with(&f.state).unwrap();
+
+        assert!(unlock_vault_with(&f.db, &f.state, PASSWORD).is_err());
+        unlock_vault_with(&f.db, &f.state, "nova-senha-789").unwrap();
+        assert!(password_check_stored(&f.db).is_some());
+    }
+
+    #[test]
+    fn legado_com_entradas_sem_verificador_nao_pode_ser_reinicializado() {
+        let f = initialized_fixture();
+        add(&f, "github.com", "ana", "senha-gh-1");
+        lock_vault_with(&f.state).unwrap();
+        remove_password_check(&f.db);
+
+        assert!(initialize_vault_with(&f.db, &f.state, "nova-senha-789").is_err());
+
+        unlock_vault_with(&f.db, &f.state, PASSWORD).unwrap();
+        let entry = first_entry(&f);
+        assert_eq!(password_of(&f, &entry.id), "senha-gh-1");
+    }
+
+    #[test]
+    fn get_password_retorna_a_senha_da_entrada() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha-site");
+        let entry = first_entry(&f);
+
+        assert_eq!(password_of(&f, &entry.id), "senha-site");
+    }
+
+    #[test]
+    fn get_password_entrada_inexistente_falha() {
+        let f = initialized_fixture();
+
+        assert!(get_password_with(&f.db, &f.state, "nao-existe").is_err());
+    }
+
+    #[test]
+    fn get_password_com_cofre_bloqueado_falha() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha");
+        let entry = first_entry(&f);
+        lock_vault_with(&f.state).unwrap();
+
+        assert!(get_password_with(&f.db, &f.state, &entry.id).is_err());
     }
 
     #[test]
@@ -557,7 +681,7 @@ mod tests {
         assert_eq!(after.created_at, before.created_at);
         assert_eq!(after.domain, "novo.com");
         assert_eq!(after.username, "ana@novo.com");
-        assert_eq!(after.password, "senha-nova");
+        assert_eq!(password_of(&f, &after.id), "senha-nova");
     }
 
     #[test]
@@ -575,7 +699,7 @@ mod tests {
 
         assert!(update_entry_with(&f.db, &f.state, &entry.id, "  ", "ana", "senha").is_err());
         assert!(update_entry_with(&f.db, &f.state, &entry.id, "site.com", "ana", "").is_err());
-        assert_eq!(first_entry(&f).password, "senha");
+        assert_eq!(password_of(&f, &entry.id), "senha");
     }
 
     #[test]

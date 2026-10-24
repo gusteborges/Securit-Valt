@@ -192,6 +192,20 @@ impl Database {
         Ok(())
     }
 
+    /// Indica se existe pelo menos uma entrada no cofre.
+    pub fn has_entries(conn: &Connection) -> Result<bool> {
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM vault_entries)", [], |row| row.get(0))
+    }
+
+    /// Remove salt e verificador. Só deve ser usado para recriar um cofre sem entradas.
+    pub fn clear_vault_config(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "DELETE FROM vault_config WHERE key IN ('argon2_salt', 'password_check')",
+            [],
+        )?;
+        Ok(())
+    }
+
     // ── Escrita ──────────────────────────────────────────────────────────────
 
     /// Encripta e salva uma entrada no cofre.
@@ -354,6 +368,27 @@ impl Database {
         }
 
         Ok(entries)
+    }
+
+    /// Lê e decripta apenas a senha de uma entrada. Retorna `None` se o id não existir.
+    pub fn get_entry_password(
+        &self,
+        id: &str,
+        master_key: &[u8; 32],
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let conn = self.open_connection()?;
+
+        let row = conn.query_row(
+            "SELECT password_encrypted, nonce_password FROM vault_entries WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        );
+
+        match row {
+            Ok((enc, nonce)) => Ok(Some(decrypt(&enc, &nonce, master_key)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
