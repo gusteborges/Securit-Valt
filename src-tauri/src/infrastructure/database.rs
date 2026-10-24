@@ -305,3 +305,178 @@ impl Database {
         Ok(entries)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::crypto::encrypt;
+    use crate::test_support::TempDir;
+
+    const KEY: [u8; 32] = [42u8; 32];
+    const OTHER_KEY: [u8; 32] = [43u8; 32];
+
+    fn schema_version(conn: &Connection) -> i32 {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn sample_entry(domain: &str) -> VaultEntry {
+        VaultEntry::new(
+            domain.to_string(),
+            "usuario@exemplo.com".to_string(),
+            "senha-forte".to_string(),
+        )
+    }
+
+    /// Banco com o schema atual já aplicado.
+    fn migrated_db() -> (TempDir, Database) {
+        let dir = TempDir::new();
+        let db = dir.database();
+        let conn = db.open_connection().unwrap();
+        Database::setup_schema(&conn).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn banco_novo_nasce_na_versao_2_com_schema_atual() {
+        let (_dir, db) = migrated_db();
+        let conn = db.open_connection().unwrap();
+
+        assert_eq!(schema_version(&conn), 2);
+
+        let columns = column_names(&conn, "vault_entries");
+        for expected in [
+            "id",
+            "domain",
+            "username_encrypted",
+            "nonce_username",
+            "password_encrypted",
+            "nonce_password",
+            "created_at",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "coluna ausente: {expected}"
+            );
+        }
+        assert!(!columns.iter().any(|c| c == "nonce"));
+        assert!(!column_names(&conn, "vault_config").is_empty());
+    }
+
+    #[test]
+    fn migra_schema_legado_preservando_dados() {
+        let dir = TempDir::new();
+        let db = dir.database();
+        let conn = db.open_connection().unwrap();
+
+        // Schema v0: coluna única `nonce` para a senha, sem nonce do username.
+        let (enc_password, nonce_password) = encrypt("senha-antiga", &KEY).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vault_entries (
+                id                 TEXT PRIMARY KEY,
+                domain             TEXT NOT NULL,
+                username_encrypted BLOB,
+                password_encrypted BLOB NOT NULL,
+                nonce              BLOB NOT NULL,
+                created_at         TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_entries
+             (id, domain, username_encrypted, password_encrypted, nonce, created_at)
+             VALUES ('legado-1', 'antigo.com', NULL, ?1, ?2, '2024-01-01T00:00:00+00:00')",
+            params![enc_password, nonce_password],
+        )
+        .unwrap();
+
+        Database::setup_schema(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn), 2);
+        let columns = column_names(&conn, "vault_entries");
+        assert!(!columns.iter().any(|c| c == "nonce"));
+        assert!(columns.iter().any(|c| c == "nonce_username"));
+
+        let entries = db.get_all_entries(&KEY).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "legado-1");
+        assert_eq!(entries[0].domain, "antigo.com");
+        assert_eq!(entries[0].password, "senha-antiga");
+        assert_eq!(entries[0].username, "[indisponível — registro legado]");
+    }
+
+    #[test]
+    fn setup_schema_e_idempotente() {
+        let (_dir, db) = migrated_db();
+        db.insert_entry(&sample_entry("site.com"), &KEY).unwrap();
+
+        let conn = db.open_connection().unwrap();
+        Database::setup_schema(&conn).unwrap();
+        Database::setup_schema(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn), 2);
+        assert_eq!(db.get_all_entries(&KEY).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_e_get_preservam_os_campos() {
+        let (_dir, db) = migrated_db();
+        let entry = sample_entry("github.com");
+
+        db.insert_entry(&entry, &KEY).unwrap();
+        let entries = db.get_all_entries(&KEY).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let stored = &entries[0];
+        assert_eq!(stored.id, entry.id);
+        assert_eq!(stored.domain, "github.com");
+        assert_eq!(stored.username, "usuario@exemplo.com");
+        assert_eq!(stored.password, "senha-forte");
+        assert_eq!(stored.created_at, entry.created_at);
+    }
+
+    #[test]
+    fn get_com_chave_errada_falha() {
+        let (_dir, db) = migrated_db();
+        db.insert_entry(&sample_entry("site.com"), &KEY).unwrap();
+
+        assert!(db.get_all_entries(&OTHER_KEY).is_err());
+    }
+
+    #[test]
+    fn salt_so_pode_ser_gravado_uma_vez() {
+        let (_dir, db) = migrated_db();
+        let conn = db.open_connection().unwrap();
+        assert!(Database::get_argon2_salt(&conn).unwrap().is_none());
+
+        let salt = [5u8; ARGON2_SALT_LEN];
+        Database::store_argon2_salt(&conn, &salt).unwrap();
+        assert_eq!(Database::get_argon2_salt(&conn).unwrap(), Some(salt));
+
+        assert!(Database::store_argon2_salt(&conn, &[6u8; ARGON2_SALT_LEN]).is_err());
+    }
+
+    #[test]
+    fn verificador_de_senha_e_persistido() {
+        let (_dir, db) = migrated_db();
+        let conn = db.open_connection().unwrap();
+        assert!(Database::get_password_check(&conn).unwrap().is_none());
+
+        Database::store_password_check(&conn, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            Database::get_password_check(&conn).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+    }
+}
+

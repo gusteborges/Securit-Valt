@@ -5,6 +5,8 @@ mod domain;
 mod infrastructure;
 mod security;
 mod application;
+#[cfg(test)]
+mod test_support;
 
 // 2. Importações
 use application::commands::{

@@ -12,6 +12,19 @@ use crate::security::{
 
 const MIN_PASSWORD_LEN: usize = 8;
 
+/// Copia a chave da sessão. O guard do mutex é liberado antes de qualquer I/O.
+fn session_key(state: &VaultState) -> Result<[u8; 32], String> {
+    let guard = state
+        .master_key
+        .lock()
+        .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
+    let key = *guard
+        .as_ref()
+        .ok_or("Cofre bloqueado. Desbloqueie o cofre antes de continuar.")?
+        .bytes();
+    Ok(key)
+}
+
 fn get_db(app: &AppHandle) -> Result<Database, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -41,9 +54,17 @@ pub fn initialize_vault(
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    validate_master_password(&password)?;
-
     let db = get_db(&app)?;
+    initialize_vault_with(&db, &state, &password)
+}
+
+fn initialize_vault_with(
+    db: &Database,
+    state: &VaultState,
+    password: &str,
+) -> Result<String, String> {
+    validate_master_password(password)?;
+
     let mut conn = db.open_connection().map_err(|e| e.to_string())?;
 
     Database::setup_schema(&conn).map_err(|e| e.to_string())?;
@@ -96,6 +117,14 @@ pub fn unlock_vault(
     state: State<VaultState>,
 ) -> Result<String, String> {
     let db = get_db(&app)?;
+    unlock_vault_with(&db, &state, &password)
+}
+
+fn unlock_vault_with(
+    db: &Database,
+    state: &VaultState,
+    password: &str,
+) -> Result<String, String> {
     let conn = db.open_connection().map_err(|e| e.to_string())?;
 
     Database::setup_schema(&conn).map_err(|e| e.to_string())?;
@@ -144,22 +173,20 @@ pub fn add_entry(
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    // Extrai a cópia dos bytes da chave e libera o guard ANTES de qualquer I/O
-    // para manter o tempo de lock mínimo.
-    let key_bytes: [u8; 32] = {
-        let guard = state
-            .master_key
-            .lock()
-            .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
-        *guard
-            .as_ref()
-            .ok_or("Cofre bloqueado. Chame unlock_vault antes de adicionar entradas.")?
-            .bytes()
-    }; // guard liberado aqui
+    let db = get_db(&app)?;
+    add_entry_with(&db, &state, domain, username, password)
+}
+
+fn add_entry_with(
+    db: &Database,
+    state: &VaultState,
+    domain: String,
+    username: String,
+    password: String,
+) -> Result<String, String> {
+    let key_bytes = session_key(state)?;
 
     let entry = VaultEntry::new(domain, username, password);
-    let db = get_db(&app)?;
-
     db.insert_entry(&entry, &key_bytes)
         .map_err(|e| e.to_string())?;
 
@@ -176,18 +203,16 @@ pub fn list_entries(
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<Vec<VaultEntryResponse>, String> {
-    let key_bytes: [u8; 32] = {
-        let guard = state
-            .master_key
-            .lock()
-            .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
-        *guard
-            .as_ref()
-            .ok_or("Cofre bloqueado. Chame unlock_vault antes de listar entradas.")?
-            .bytes()
-    }; // guard liberado aqui
-
     let db = get_db(&app)?;
+    list_entries_with(&db, &state)
+}
+
+fn list_entries_with(
+    db: &Database,
+    state: &VaultState,
+) -> Result<Vec<VaultEntryResponse>, String> {
+    let key_bytes = session_key(state)?;
+
     let entries = db
         .get_all_entries(&key_bytes)
         .map_err(|e| e.to_string())?;
@@ -200,6 +225,10 @@ pub fn list_entries(
 /// Bloqueia o cofre: descarta a chave mestra da memória (zeroizada pelo `Drop`).
 #[tauri::command]
 pub fn lock_vault(state: State<VaultState>) -> Result<String, String> {
+    lock_vault_with(&state)
+}
+
+fn lock_vault_with(state: &VaultState) -> Result<String, String> {
     let mut guard = state
         .master_key
         .lock()
@@ -218,6 +247,10 @@ pub fn vault_status(
     state: State<VaultState>,
 ) -> Result<VaultStatus, String> {
     let db = get_db(&app)?;
+    vault_status_with(&db, &state)
+}
+
+fn vault_status_with(db: &Database, state: &VaultState) -> Result<VaultStatus, String> {
     let conn = db.open_connection().map_err(|e| e.to_string())?;
 
     Database::setup_schema(&conn).map_err(|e| e.to_string())?;
@@ -262,5 +295,174 @@ impl From<VaultEntry> for VaultEntryResponse {
             password: e.password,
             created_at: e.created_at.to_rfc3339(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    const PASSWORD: &str = "senha-mestra-123";
+    const WRONG_PASSWORD: &str = "senha-errada-456";
+
+    struct Fixture {
+        _dir: TempDir,
+        db: Database,
+        state: VaultState,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new();
+        let db = dir.database();
+        Fixture {
+            _dir: dir,
+            db,
+            state: VaultState::new(),
+        }
+    }
+
+    fn initialized_fixture() -> Fixture {
+        let f = fixture();
+        initialize_vault_with(&f.db, &f.state, PASSWORD).unwrap();
+        f
+    }
+
+    fn add(f: &Fixture, domain: &str, username: &str, password: &str) {
+        add_entry_with(
+            &f.db,
+            &f.state,
+            domain.into(),
+            username.into(),
+            password.into(),
+        )
+        .unwrap();
+    }
+
+    fn password_check_stored(db: &Database) -> Option<Vec<u8>> {
+        let conn = db.open_connection().unwrap();
+        Database::get_password_check(&conn).unwrap()
+    }
+
+    fn remove_password_check(db: &Database) {
+        let conn = db.open_connection().unwrap();
+        conn.execute("DELETE FROM vault_config WHERE key = 'password_check'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn inicializar_deixa_o_cofre_desbloqueado() {
+        let f = initialized_fixture();
+
+        let status = vault_status_with(&f.db, &f.state).unwrap();
+        assert!(status.initialized);
+        assert!(status.unlocked);
+    }
+
+    #[test]
+    fn senha_curta_nao_cria_cofre() {
+        let f = fixture();
+
+        assert!(initialize_vault_with(&f.db, &f.state, "curta").is_err());
+
+        let status = vault_status_with(&f.db, &f.state).unwrap();
+        assert!(!status.initialized);
+        assert!(!status.unlocked);
+    }
+
+    #[test]
+    fn inicializar_duas_vezes_falha() {
+        let f = initialized_fixture();
+
+        assert!(initialize_vault_with(&f.db, &f.state, PASSWORD).is_err());
+    }
+
+    #[test]
+    fn bloquear_impede_adicionar_e_listar() {
+        let f = initialized_fixture();
+
+        lock_vault_with(&f.state).unwrap();
+
+        let status = vault_status_with(&f.db, &f.state).unwrap();
+        assert!(status.initialized);
+        assert!(!status.unlocked);
+        assert!(add_entry_with(
+            &f.db,
+            &f.state,
+            "site.com".into(),
+            "usuario".into(),
+            "senha".into(),
+        )
+        .is_err());
+        assert!(list_entries_with(&f.db, &f.state).is_err());
+    }
+
+    #[test]
+    fn senha_errada_nao_desbloqueia() {
+        let f = initialized_fixture();
+        lock_vault_with(&f.state).unwrap();
+
+        assert!(unlock_vault_with(&f.db, &f.state, WRONG_PASSWORD).is_err());
+
+        assert!(!vault_status_with(&f.db, &f.state).unwrap().unlocked);
+        assert!(list_entries_with(&f.db, &f.state).is_err());
+    }
+
+    #[test]
+    fn senha_certa_desbloqueia_apos_bloqueio() {
+        let f = initialized_fixture();
+        lock_vault_with(&f.state).unwrap();
+
+        unlock_vault_with(&f.db, &f.state, PASSWORD).unwrap();
+
+        assert!(vault_status_with(&f.db, &f.state).unwrap().unlocked);
+    }
+
+    #[test]
+    fn fluxo_completo_preserva_entradas() {
+        let f = initialized_fixture();
+        add(&f, "github.com", "ana", "senha-gh-1");
+        add(&f, "mail.com", "ana@mail.com", "senha-mail-2");
+        lock_vault_with(&f.state).unwrap();
+
+        assert!(unlock_vault_with(&f.db, &f.state, WRONG_PASSWORD).is_err());
+        unlock_vault_with(&f.db, &f.state, PASSWORD).unwrap();
+
+        let entries = list_entries_with(&f.db, &f.state).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let github = entries.iter().find(|e| e.domain == "github.com").unwrap();
+        assert_eq!(github.username, "ana");
+        assert_eq!(github.password, "senha-gh-1");
+
+        let mail = entries.iter().find(|e| e.domain == "mail.com").unwrap();
+        assert_eq!(mail.username, "ana@mail.com");
+        assert_eq!(mail.password, "senha-mail-2");
+    }
+
+    #[test]
+    fn legado_sem_verificador_rejeita_senha_errada_sem_gravar_verificador() {
+        let f = initialized_fixture();
+        add(&f, "github.com", "ana", "senha-gh-1");
+        lock_vault_with(&f.state).unwrap();
+        remove_password_check(&f.db);
+
+        assert!(unlock_vault_with(&f.db, &f.state, WRONG_PASSWORD).is_err());
+
+        assert!(password_check_stored(&f.db).is_none());
+        assert!(!vault_status_with(&f.db, &f.state).unwrap().unlocked);
+    }
+
+    #[test]
+    fn legado_sem_verificador_aceita_senha_certa_e_grava_verificador() {
+        let f = initialized_fixture();
+        add(&f, "github.com", "ana", "senha-gh-1");
+        lock_vault_with(&f.state).unwrap();
+        remove_password_check(&f.db);
+
+        unlock_vault_with(&f.db, &f.state, PASSWORD).unwrap();
+
+        assert!(password_check_stored(&f.db).is_some());
+        assert_eq!(list_entries_with(&f.db, &f.state).unwrap().len(), 1);
     }
 }
