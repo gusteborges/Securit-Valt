@@ -230,6 +230,57 @@ impl Database {
         Ok(())
     }
 
+    /// Substitui domain, username e password de uma entrada existente.
+    ///
+    /// Gera novos nonces para os campos cifrados e preserva `id` e `created_at`.
+    /// Falha se a entrada não existir.
+    pub fn update_entry(
+        &self,
+        id: &str,
+        domain: &str,
+        username: &str,
+        password: &str,
+        master_key: &[u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.open_connection()?;
+
+        let (enc_password, nonce_password) = encrypt(password, master_key)?;
+        let (enc_username, nonce_username) = encrypt(username, master_key)?;
+
+        let updated = conn.execute(
+            "UPDATE vault_entries
+             SET domain = ?2,
+                 username_encrypted = ?3, nonce_username = ?4,
+                 password_encrypted = ?5, nonce_password = ?6
+             WHERE id = ?1",
+            params![
+                id,
+                domain,
+                enc_username,
+                nonce_username,
+                enc_password,
+                nonce_password
+            ],
+        )?;
+
+        if updated == 0 {
+            return Err("Entrada não encontrada.".into());
+        }
+        Ok(())
+    }
+
+    /// Remove uma entrada pelo id. Falha se a entrada não existir.
+    pub fn delete_entry(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.open_connection()?;
+
+        let deleted = conn.execute("DELETE FROM vault_entries WHERE id = ?1", params![id])?;
+
+        if deleted == 0 {
+            return Err("Entrada não encontrada.".into());
+        }
+        Ok(())
+    }
+
     // ── Leitura ──────────────────────────────────────────────────────────────
 
     /// Lê e decripta todas as entradas do cofre.

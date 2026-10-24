@@ -25,6 +25,13 @@ fn session_key(state: &VaultState) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+fn validate_entry_fields(domain: &str, password: &str) -> Result<(), String> {
+    if domain.trim().is_empty() || password.is_empty() {
+        return Err("Domínio e senha são obrigatórios.".into());
+    }
+    Ok(())
+}
+
 fn get_db(app: &AppHandle) -> Result<Database, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -184,6 +191,7 @@ fn add_entry_with(
     username: String,
     password: String,
 ) -> Result<String, String> {
+    validate_entry_fields(&domain, &password)?;
     let key_bytes = session_key(state)?;
 
     let entry = VaultEntry::new(domain, username, password);
@@ -238,7 +246,65 @@ fn lock_vault_with(state: &VaultState) -> Result<String, String> {
     Ok("Cofre bloqueado.".into())
 }
 
-// ── Comando 6: vault_status ──────────────────────────────────────────────────
+// ── Comando 5: update_entry ──────────────────────────────────────────────────
+
+/// Atualiza domain, username e password de uma entrada existente.
+///
+/// Requer que o cofre esteja desbloqueado.
+#[tauri::command]
+pub fn update_entry(
+    id: String,
+    domain: String,
+    username: String,
+    password: String,
+    app: AppHandle,
+    state: State<VaultState>,
+) -> Result<String, String> {
+    let db = get_db(&app)?;
+    update_entry_with(&db, &state, &id, &domain, &username, &password)
+}
+
+fn update_entry_with(
+    db: &Database,
+    state: &VaultState,
+    id: &str,
+    domain: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, String> {
+    validate_entry_fields(domain, password)?;
+    let key_bytes = session_key(state)?;
+
+    db.update_entry(id, domain, username, password, &key_bytes)
+        .map_err(|e| e.to_string())?;
+
+    Ok("Entrada atualizada.".into())
+}
+
+// ── Comando 6: delete_entry ──────────────────────────────────────────────────
+
+/// Remove uma entrada do cofre.
+///
+/// Requer que o cofre esteja desbloqueado, como as demais operações de dados.
+#[tauri::command]
+pub fn delete_entry(
+    id: String,
+    app: AppHandle,
+    state: State<VaultState>,
+) -> Result<String, String> {
+    let db = get_db(&app)?;
+    delete_entry_with(&db, &state, &id)
+}
+
+fn delete_entry_with(db: &Database, state: &VaultState, id: &str) -> Result<String, String> {
+    session_key(state)?;
+
+    db.delete_entry(id).map_err(|e| e.to_string())?;
+
+    Ok("Entrada removida.".into())
+}
+
+// ── Comando 7: vault_status ──────────────────────────────────────────────────
 
 /// Informa se o cofre já foi inicializado e se está desbloqueado nesta sessão.
 #[tauri::command]
@@ -463,6 +529,100 @@ mod tests {
         unlock_vault_with(&f.db, &f.state, PASSWORD).unwrap();
 
         assert!(password_check_stored(&f.db).is_some());
+        assert_eq!(list_entries_with(&f.db, &f.state).unwrap().len(), 1);
+    }
+
+    fn first_entry(f: &Fixture) -> VaultEntryResponse {
+        list_entries_with(&f.db, &f.state).unwrap().remove(0)
+    }
+
+    #[test]
+    fn editar_atualiza_campos_e_preserva_id_e_data() {
+        let f = initialized_fixture();
+        add(&f, "antigo.com", "ana", "senha-antiga");
+        let before = first_entry(&f);
+
+        update_entry_with(
+            &f.db,
+            &f.state,
+            &before.id,
+            "novo.com",
+            "ana@novo.com",
+            "senha-nova",
+        )
+        .unwrap();
+
+        let after = first_entry(&f);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.domain, "novo.com");
+        assert_eq!(after.username, "ana@novo.com");
+        assert_eq!(after.password, "senha-nova");
+    }
+
+    #[test]
+    fn editar_entrada_inexistente_falha() {
+        let f = initialized_fixture();
+
+        assert!(update_entry_with(&f.db, &f.state, "nao-existe", "a.com", "u", "s").is_err());
+    }
+
+    #[test]
+    fn editar_com_campos_obrigatorios_vazios_falha() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha");
+        let entry = first_entry(&f);
+
+        assert!(update_entry_with(&f.db, &f.state, &entry.id, "  ", "ana", "senha").is_err());
+        assert!(update_entry_with(&f.db, &f.state, &entry.id, "site.com", "ana", "").is_err());
+        assert_eq!(first_entry(&f).password, "senha");
+    }
+
+    #[test]
+    fn editar_com_cofre_bloqueado_falha() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha");
+        let entry = first_entry(&f);
+        lock_vault_with(&f.state).unwrap();
+
+        assert!(update_entry_with(&f.db, &f.state, &entry.id, "x.com", "ana", "nova").is_err());
+    }
+
+    #[test]
+    fn excluir_remove_a_entrada() {
+        let f = initialized_fixture();
+        add(&f, "um.com", "ana", "senha-1");
+        add(&f, "dois.com", "ana", "senha-2");
+        let entry = list_entries_with(&f.db, &f.state)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.domain == "um.com")
+            .unwrap();
+
+        delete_entry_with(&f.db, &f.state, &entry.id).unwrap();
+
+        let restantes = list_entries_with(&f.db, &f.state).unwrap();
+        assert_eq!(restantes.len(), 1);
+        assert_eq!(restantes[0].domain, "dois.com");
+    }
+
+    #[test]
+    fn excluir_entrada_inexistente_falha() {
+        let f = initialized_fixture();
+
+        assert!(delete_entry_with(&f.db, &f.state, "nao-existe").is_err());
+    }
+
+    #[test]
+    fn excluir_com_cofre_bloqueado_falha() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha");
+        let entry = first_entry(&f);
+        lock_vault_with(&f.state).unwrap();
+
+        assert!(delete_entry_with(&f.db, &f.state, &entry.id).is_err());
+
+        unlock_vault_with(&f.db, &f.state, PASSWORD).unwrap();
         assert_eq!(list_entries_with(&f.db, &f.state).unwrap().len(), 1);
     }
 }

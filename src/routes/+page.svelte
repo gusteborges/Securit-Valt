@@ -37,6 +37,23 @@
   let modalError = "";
   let modalBusy = false;
 
+  // Busca no cofre
+  let searchQuery = "";
+
+  // Edição e exclusão de entradas
+  const LEGACY_USERNAME = "[indisponível — registro legado]";
+  let editingId: string | null = null;
+  let deletingId: string | null = null;
+  let itemBusy = false;
+
+  // Copiar senha com limpeza automática da área de transferência
+  const CLIPBOARD_CLEAR_MS = 30_000;
+  let clipboardTimer: ReturnType<typeof setTimeout> | null = null;
+  let clipboardValue = "";
+  let clipboardNotice = "";
+
+  $: filteredEntries = filterEntries(entries, searchQuery);
+
   function errorMessage(e: unknown): string {
     if (typeof e === "string") return e;
     return e instanceof Error ? e.message : String(e);
@@ -117,8 +134,12 @@
       listError = errorMessage(e);
       return;
     }
+    await limparClipboard();
     entries = [];
     modalOpen = false;
+    editingId = null;
+    deletingId = null;
+    searchQuery = "";
     masterPassword = "";
     confirmPassword = "";
     authError = "";
@@ -126,6 +147,7 @@
   }
 
   function novoItem() {
+    editingId = null;
     newDomain = "";
     newUsername = "";
     newPassword = "";
@@ -133,9 +155,58 @@
     modalOpen = true;
   }
 
+  function editarItem(entry: VaultEntry) {
+    editingId = entry.id;
+    newDomain = entry.domain;
+    newUsername = entry.username === LEGACY_USERNAME ? "" : entry.username;
+    newPassword = entry.password;
+    modalError = "";
+    modalOpen = true;
+  }
+
   function fecharModal() {
     modalOpen = false;
+    editingId = null;
     newPassword = "";
+  }
+
+  function filterEntries(list: VaultEntry[], query: string): VaultEntry[] {
+    const q = query.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(
+      (e) => e.domain.toLowerCase().includes(q) || e.username.toLowerCase().includes(q),
+    );
+  }
+
+  async function copiarSenha(entry: VaultEntry) {
+    try {
+      await navigator.clipboard.writeText(entry.password);
+    } catch {
+      clipboardNotice = "Não foi possível copiar a senha.";
+      return;
+    }
+    clipboardValue = entry.password;
+    clipboardNotice = `Senha de ${entry.domain} copiada. A área de transferência será limpa em 30 segundos.`;
+    if (clipboardTimer) clearTimeout(clipboardTimer);
+    clipboardTimer = setTimeout(limparClipboard, CLIPBOARD_CLEAR_MS);
+  }
+
+  async function limparClipboard() {
+    if (clipboardTimer) clearTimeout(clipboardTimer);
+    clipboardTimer = null;
+    if (!clipboardValue) return;
+    const copiado = clipboardValue;
+    clipboardValue = "";
+    clipboardNotice = "";
+    let atual: string | null = null;
+    try {
+      atual = await navigator.clipboard.readText();
+    } catch {
+      // Sem permissão de leitura: limpa mesmo assim, para não deixar a senha exposta.
+    }
+    if (atual === null || atual === copiado) {
+      await navigator.clipboard.writeText("").catch(() => {});
+    }
   }
 
   async function salvarItem() {
@@ -147,17 +218,35 @@
 
     modalBusy = true;
     try {
-      await invoke("add_entry", {
+      const dados = {
         domain: newDomain.trim(),
         username: newUsername.trim(),
         password: newPassword,
-      });
+      };
+      if (editingId) {
+        await invoke("update_entry", { id: editingId, ...dados });
+      } else {
+        await invoke("add_entry", dados);
+      }
       fecharModal();
       await loadEntries();
     } catch (e) {
       modalError = errorMessage(e);
     } finally {
       modalBusy = false;
+    }
+  }
+
+  async function excluirItem(id: string) {
+    itemBusy = true;
+    try {
+      await invoke("delete_entry", { id });
+      deletingId = null;
+      await loadEntries();
+    } catch (e) {
+      listError = errorMessage(e);
+    } finally {
+      itemBusy = false;
     }
   }
 
@@ -273,6 +362,8 @@
         <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">🔍</span>
         <input 
           type="text" 
+          bind:value={searchQuery}
+          aria-label="Buscar no cofre"
           placeholder="Buscar no cofre..." 
           class="w-full bg-surface border border-gray-700 text-sm rounded-full py-2 pl-10 pr-4 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all placeholder-gray-600 text-gray-200"
         />
@@ -289,26 +380,71 @@
     <div class="flex-1 overflow-y-auto p-8">
       <div class="flex items-center justify-between mb-6">
         <h2 class="text-xl font-semibold text-white">Todas as Senhas</h2>
-        <span class="text-xs text-gray-500 bg-surface px-2 py-1 rounded-md border border-gray-700">{entries.length} {entries.length === 1 ? "item" : "itens"}</span>
+        <span class="text-xs text-gray-500 bg-surface px-2 py-1 rounded-md border border-gray-700">{filteredEntries.length} {filteredEntries.length === 1 ? "item" : "itens"}</span>
       </div>
 
       {#if listError}
         <p class="text-sm text-danger mb-4">{listError}</p>
       {/if}
 
+      {#if clipboardNotice}
+        <p class="text-sm text-primary mb-4">{clipboardNotice}</p>
+      {/if}
+
       {#if entries.length === 0}
         <div class="text-center text-gray-500 text-sm py-16 border border-dashed border-gray-800 rounded-xl">
           Nenhuma senha cadastrada ainda. Clique em "Novo Item" para começar.
         </div>
+      {:else if filteredEntries.length === 0}
+        <div class="text-center text-gray-500 text-sm py-16 border border-dashed border-gray-800 rounded-xl">
+          Nenhum item encontrado para "{searchQuery}".
+        </div>
       {:else}
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {#each entries as entry (entry.id)}
+        {#each filteredEntries as entry (entry.id)}
           <div class="bg-surface p-4 rounded-xl border border-gray-800 hover:border-primary/50 transition-all hover:shadow-lg hover:shadow-black/40">
             <div class="w-10 h-10 mb-4 rounded-full bg-primary/20 flex items-center justify-center text-xl font-bold text-primary uppercase">
               {entry.domain.charAt(0)}
             </div>
             <h3 class="font-bold text-gray-200 text-lg truncate" title={entry.domain}>{entry.domain}</h3>
             <p class="text-xs text-gray-400 mt-1 truncate">{entry.username || "Sem usuário"}</p>
+
+            <div class="flex items-center gap-2 mt-4">
+              <button
+                on:click={() => copiarSenha(entry)}
+                class="flex-1 text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:bg-white/5 transition-colors"
+              >
+                Copiar senha
+              </button>
+              <button
+                on:click={() => editarItem(entry)}
+                class="text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:bg-white/5 transition-colors"
+              >
+                Editar
+              </button>
+              {#if deletingId === entry.id}
+                <button
+                  on:click={() => excluirItem(entry.id)}
+                  disabled={itemBusy}
+                  class="text-xs py-1.5 px-2 rounded-lg border border-danger text-danger hover:bg-danger/10 disabled:opacity-50 transition-colors"
+                >
+                  Confirmar
+                </button>
+                <button
+                  on:click={() => (deletingId = null)}
+                  class="text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
+                >
+                  Cancelar
+                </button>
+              {:else}
+                <button
+                  on:click={() => (deletingId = entry.id)}
+                  class="text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-400 hover:text-danger hover:border-danger transition-colors"
+                >
+                  Excluir
+                </button>
+              {/if}
+            </div>
           </div>
         {/each}
       </div>
@@ -322,7 +458,7 @@
       class="w-full max-w-md bg-surface p-6 rounded-xl border border-gray-800 space-y-4"
       on:submit|preventDefault={salvarItem}
     >
-      <h2 class="text-lg font-semibold text-white">Novo Item</h2>
+      <h2 class="text-lg font-semibold text-white">{editingId ? "Editar Item" : "Novo Item"}</h2>
 
       <label class="block space-y-1">
         <span class="text-xs text-gray-400">Domínio *</span>
