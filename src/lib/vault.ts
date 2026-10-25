@@ -3,7 +3,18 @@ export interface VaultEntry {
   domain: string;
   username: string;
   created_at: string;
+  favorite: boolean;
 }
+
+export interface PasswordGeneratorOptions {
+  uppercase: boolean;
+  lowercase: boolean;
+  numbers: boolean;
+  symbols: boolean;
+}
+
+export const MIN_GENERATED_PASSWORD_LENGTH = 8;
+export const MAX_GENERATED_PASSWORD_LENGTH = 128;
 
 export const MIN_MASTER_PASSWORD_LENGTH = 8;
 export const LEGACY_USERNAME = "[indisponível — registro legado]";
@@ -49,14 +60,71 @@ export function validateEntryFields(domain: string, password: string): string | 
   return null;
 }
 
-export function filterEntries(list: VaultEntry[], query: string): VaultEntry[] {
+export function filterEntries(
+  list: VaultEntry[],
+  query: string,
+  favoritesOnly = false,
+): VaultEntry[] {
+  const candidates = favoritesOnly ? list.filter((entry) => entry.favorite) : list;
   const normalizedQuery = query.trim().toLowerCase();
-  if (!normalizedQuery) return list;
-  return list.filter(
+  if (!normalizedQuery) return candidates;
+  return candidates.filter(
     (entry) =>
       entry.domain.toLowerCase().includes(normalizedQuery) ||
       entry.username.toLowerCase().includes(normalizedQuery),
   );
+}
+
+export function generatePassword(
+  length: number,
+  options: PasswordGeneratorOptions,
+): string {
+  if (
+    !Number.isInteger(length) ||
+    length < MIN_GENERATED_PASSWORD_LENGTH ||
+    length > MAX_GENERATED_PASSWORD_LENGTH
+  ) {
+    throw new RangeError(
+      `O tamanho deve ficar entre ${MIN_GENERATED_PASSWORD_LENGTH} e ${MAX_GENERATED_PASSWORD_LENGTH} caracteres.`,
+    );
+  }
+
+  const groups = [
+    options.uppercase ? "ABCDEFGHIJKLMNOPQRSTUVWXYZ" : "",
+    options.lowercase ? "abcdefghijklmnopqrstuvwxyz" : "",
+    options.numbers ? "0123456789" : "",
+    options.symbols ? "!@#$%^&*()-_=+[]{};:,.?/" : "",
+  ].filter((group) => group.length > 0);
+
+  if (groups.length === 0) {
+    throw new Error("Selecione pelo menos um tipo de caractere.");
+  }
+
+  const availableCharacters = groups.join("");
+  const password = groups.map((group) => group[randomIndex(group.length)]);
+
+  while (password.length < length) {
+    password.push(availableCharacters[randomIndex(availableCharacters.length)]);
+  }
+
+  for (let index = password.length - 1; index > 0; index -= 1) {
+    const swapIndex = randomIndex(index + 1);
+    [password[index], password[swapIndex]] = [password[swapIndex], password[index]];
+  }
+
+  return password.join("");
+}
+
+function randomIndex(maxExclusive: number): number {
+  const uint32Range = 0x1_0000_0000;
+  const rejectionLimit = Math.floor(uint32Range / maxExclusive) * maxExclusive;
+  const randomValue = new Uint32Array(1);
+
+  do {
+    crypto.getRandomValues(randomValue);
+  } while (randomValue[0] >= rejectionLimit);
+
+  return randomValue[0] % maxExclusive;
 }
 
 export function usernameForEditing(username: string): string {

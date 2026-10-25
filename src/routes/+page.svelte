@@ -1,5 +1,4 @@
 <script lang="ts">
-  import "../routes/app.css"; 
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -12,10 +11,14 @@
     CLIPBOARD_CLEAR_MS,
     createInactivityTimer,
     filterEntries,
+    generatePassword as generateSecurePassword,
+    MAX_GENERATED_PASSWORD_LENGTH,
+    MIN_GENERATED_PASSWORD_LENGTH,
     usernameForEditing,
     MIN_MASTER_PASSWORD_LENGTH,
     validateEntryFields,
     validateMasterPassword,
+    type PasswordGeneratorOptions,
     type VaultEntry,
   } from "$lib/vault";
 
@@ -24,44 +27,61 @@
     unlocked: boolean;
   }
 
-  let status: "loading" | "setup" | "locked" | "unlocked" = "loading";
-  let activeTab = "cofre";
-  let entries: VaultEntry[] = [];
-  let listError = "";
+  function submitAuth(event: SubmitEvent) {
+    event.preventDefault();
+    void (status === "setup" ? initializeVault() : unlockVault());
+  }
+
+  let status = $state<"loading" | "setup" | "locked" | "unlocked">("loading");
+  let activeTab = $state("cofre");
+  let entries = $state<VaultEntry[]>([]);
+  let listError = $state("");
+  let favoriteBusyId = $state<string | null>(null);
 
   // Telas de criação e desbloqueio
-  let masterPassword = "";
-  let confirmPassword = "";
-  let authError = "";
-  let authBusy = false;
+  let masterPassword = $state("");
+  let confirmPassword = $state("");
+  let authError = $state("");
+  let authBusy = $state(false);
 
   // Modal "Novo Item"
-  let modalOpen = false;
-  let newDomain = "";
-  let newUsername = "";
-  let newPassword = "";
-  let modalError = "";
-  let modalBusy = false;
+  let modalOpen = $state(false);
+  let newDomain = $state("");
+  let newUsername = $state("");
+  let newPassword = $state("");
+  let modalError = $state("");
+  let modalBusy = $state(false);
 
   // Busca no cofre
-  let searchQuery = "";
+  let searchQuery = $state("");
+  let generatorLength = $state(20);
+  let generatorOptions = $state<PasswordGeneratorOptions>({
+    uppercase: true,
+    lowercase: true,
+    numbers: true,
+    symbols: true,
+  });
+  let generatedPassword = $state("");
+  let generatorError = $state("");
 
   // Edição e exclusão de entradas
-  let editingId: string | null = null;
-  let deletingId: string | null = null;
-  let itemBusy = false;
+  let editingId = $state<string | null>(null);
+  let deletingId = $state<string | null>(null);
+  let itemBusy = $state(false);
 
   // Copiar senha com limpeza automática da área de transferência
   let clipboardTimer: ReturnType<typeof setTimeout> | null = null;
-  let clipboardValue = "";
-  let clipboardNotice = "";
+  let clipboardValue = $state("");
+  let clipboardNotice = $state("");
   let lastActivityAt = 0;
   let lockInProgress = false;
   const inactivityTimer = createInactivityTimer(() => {
     void lockVault(true);
   }, AUTO_LOCK_MS);
 
-  $: filteredEntries = filterEntries(entries, searchQuery);
+  let filteredEntries = $derived(
+    filterEntries(entries, searchQuery, activeTab === "favoritos"),
+  );
 
   function errorMessage(e: unknown): string {
     if (typeof e === "string") return e;
@@ -199,15 +219,48 @@
     let senha: string;
     try {
       senha = await invoke<string>("get_password", { id: entry.id });
-      await writeSecret(senha);
-    } catch {
-      clipboardNotice = "Não foi possível copiar a senha.";
+    } catch (e) {
+      clipboardNotice = `Não foi possível copiar a senha: ${errorMessage(e)}`;
       return;
     }
-    clipboardValue = senha;
+    await copySecret(senha);
+  }
+
+  async function copySecret(secret: string) {
+    try {
+      await writeSecret(secret);
+    } catch (e) {
+      clipboardNotice = `Não foi possível copiar a senha: ${errorMessage(e)}`;
+      return;
+    }
+    clipboardValue = secret;
     clipboardNotice = "Senha copiada. A área de transferência será limpa após 15 segundos.";
     if (clipboardTimer) clearTimeout(clipboardTimer);
     clipboardTimer = setTimeout(limparClipboard, CLIPBOARD_CLEAR_MS);
+  }
+
+  async function toggleFavorite(entry: VaultEntry) {
+    if (favoriteBusyId) return;
+    favoriteBusyId = entry.id;
+    listError = "";
+    try {
+      await invoke("set_favorite", { id: entry.id, favorite: !entry.favorite });
+      await loadEntries();
+    } catch (e) {
+      listError = errorMessage(e);
+    } finally {
+      favoriteBusyId = null;
+    }
+  }
+
+  function generateNewPassword() {
+    generatorError = "";
+    try {
+      generatedPassword = generateSecurePassword(generatorLength, generatorOptions);
+    } catch (e) {
+      generatedPassword = "";
+      generatorError = errorMessage(e);
+    }
   }
 
   async function limparClipboard(): Promise<boolean> {
@@ -327,7 +380,7 @@
 <main class="flex h-screen w-screen bg-bg text-gray-100 items-center justify-center font-sans">
   <form
     class="w-full max-w-sm bg-surface p-8 rounded-xl border border-gray-800 space-y-4"
-    on:submit|preventDefault={status === "setup" ? initializeVault : unlockVault}
+    onsubmit={submitAuth}
   >
     <div class="text-center">
       <h1 class="text-2xl font-bold tracking-tight text-primary">SecureVault 🔒</h1>
@@ -391,7 +444,7 @@
       <button 
         class="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors
         {activeTab === 'cofre' ? 'bg-primary/10 text-primary' : 'text-gray-400 hover:bg-white/5 hover:text-white'}"
-        on:click={() => activeTab = 'cofre'}
+        onclick={() => activeTab = 'cofre'}
       >
         <span>🔐</span> Todos os Itens
       </button>
@@ -399,7 +452,7 @@
       <button 
         class="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors
         {activeTab === 'favoritos' ? 'bg-primary/10 text-primary' : 'text-gray-400 hover:bg-white/5 hover:text-white'}"
-        on:click={() => activeTab = 'favoritos'}
+        onclick={() => activeTab = 'favoritos'}
       >
         <span>⭐</span> Favoritos
       </button>
@@ -407,7 +460,7 @@
       <button 
         class="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors
         {activeTab === 'gerador' ? 'bg-primary/10 text-primary' : 'text-gray-400 hover:bg-white/5 hover:text-white'}"
-        on:click={() => activeTab = 'gerador'}
+        onclick={() => activeTab = 'gerador'}
       >
         <span>⚡</span> Gerador
       </button>
@@ -415,7 +468,7 @@
 
     <div class="p-4 border-t border-gray-800">
       <button
-        on:click={() => lockVault()}
+        onclick={() => lockVault()}
         class="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-500 hover:text-danger transition-colors"
       >
         <span>🚪</span> Bloquear Cofre
@@ -425,29 +478,111 @@
 
   <div class="flex-1 flex flex-col h-full bg-bg">
     
-    <header class="h-16 border-b border-gray-800 flex items-center justify-between px-8 bg-surface/30 backdrop-blur-sm">
-      <div class="relative w-96">
-        <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">🔍</span>
-        <input 
-          type="text" 
-          bind:value={searchQuery}
-          aria-label="Buscar no cofre"
-          placeholder="Buscar no cofre..." 
-          class="w-full bg-surface border border-gray-700 text-sm rounded-full py-2 pl-10 pr-4 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all placeholder-gray-600 text-gray-200"
-        />
-      </div>
+    {#if activeTab === "gerador"}
+      <header class="h-16 border-b border-gray-800 flex items-center px-8 bg-surface/30 backdrop-blur-sm">
+        <h2 class="text-lg font-semibold text-white">Gerador de senhas</h2>
+      </header>
+    {:else}
+      <header class="h-16 border-b border-gray-800 flex items-center justify-between px-8 bg-surface/30 backdrop-blur-sm">
+        <div class="relative w-96">
+          <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">🔍</span>
+          <input
+            type="text"
+            bind:value={searchQuery}
+            aria-label="Buscar no cofre"
+            placeholder="Buscar no cofre..."
+            class="w-full bg-surface border border-gray-700 text-sm rounded-full py-2 pl-10 pr-4 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all placeholder-gray-600 text-gray-200"
+          />
+        </div>
 
-      <button 
-        on:click={novoItem}
-        class="bg-primary hover:bg-primary/90 text-bg font-bold py-2 px-6 rounded-full text-sm shadow-lg shadow-primary/20 transition-transform active:scale-95 flex items-center gap-2"
-      >
-        <span>+</span> Novo Item
-      </button>
-    </header>
+        <button
+          onclick={novoItem}
+          class="bg-primary hover:bg-primary/90 text-bg font-bold py-2 px-6 rounded-full text-sm shadow-lg shadow-primary/20 transition-transform active:scale-95 flex items-center gap-2"
+        >
+          <span>+</span> Novo Item
+        </button>
+      </header>
+    {/if}
 
     <div class="flex-1 overflow-y-auto p-8">
+      {#if activeTab === "gerador"}
+        <section class="mx-auto max-w-xl space-y-6 rounded-xl border border-gray-800 bg-surface p-6">
+          <div>
+            <label for="password-length" class="mb-2 block text-sm font-medium text-gray-200">
+              Tamanho: {generatorLength} caracteres
+            </label>
+            <input
+              id="password-length"
+              type="range"
+              min={MIN_GENERATED_PASSWORD_LENGTH}
+              max={MAX_GENERATED_PASSWORD_LENGTH}
+              bind:value={generatorLength}
+              class="w-full accent-primary"
+            />
+            <div class="flex justify-between text-xs text-gray-500">
+              <span>{MIN_GENERATED_PASSWORD_LENGTH}</span>
+              <span>{MAX_GENERATED_PASSWORD_LENGTH}</span>
+            </div>
+          </div>
+
+          <fieldset class="space-y-3">
+            <legend class="mb-3 text-sm font-medium text-gray-200">Tipos de caracteres</legend>
+            <label class="flex items-center gap-3 text-sm text-gray-300">
+              <input type="checkbox" bind:checked={generatorOptions.uppercase} class="accent-primary" />
+              Letras maiúsculas (A-Z)
+            </label>
+            <label class="flex items-center gap-3 text-sm text-gray-300">
+              <input type="checkbox" bind:checked={generatorOptions.lowercase} class="accent-primary" />
+              Letras minúsculas (a-z)
+            </label>
+            <label class="flex items-center gap-3 text-sm text-gray-300">
+              <input type="checkbox" bind:checked={generatorOptions.numbers} class="accent-primary" />
+              Números (0-9)
+            </label>
+            <label class="flex items-center gap-3 text-sm text-gray-300">
+              <input type="checkbox" bind:checked={generatorOptions.symbols} class="accent-primary" />
+              Símbolos
+            </label>
+          </fieldset>
+
+          <button
+            onclick={generateNewPassword}
+            class="w-full rounded-lg bg-primary px-4 py-2 text-sm font-bold text-bg hover:bg-primary/90"
+          >
+            Gerar senha
+          </button>
+
+          {#if generatedPassword}
+            <div class="flex gap-2">
+              <input
+                aria-label="Senha gerada"
+                readonly
+                value={generatedPassword}
+                class="min-w-0 flex-1 rounded-lg border border-gray-700 bg-bg px-3 py-2 font-mono text-sm text-gray-200"
+              />
+              <button
+                onclick={() => copySecret(generatedPassword)}
+                class="rounded-lg border border-gray-700 px-4 py-2 text-sm text-gray-200 hover:bg-white/5"
+              >
+                Copiar
+              </button>
+            </div>
+          {/if}
+
+          {#if generatorError}
+            <p class="text-sm text-danger">{generatorError}</p>
+          {/if}
+          {#if clipboardNotice}
+            <p class="text-sm {clipboardNotice.startsWith('Não foi possível') ? 'text-danger' : 'text-primary'}">
+              {clipboardNotice}
+            </p>
+          {/if}
+        </section>
+      {:else}
       <div class="flex items-center justify-between mb-6">
-        <h2 class="text-xl font-semibold text-white">Todas as Senhas</h2>
+        <h2 class="text-xl font-semibold text-white">
+          {activeTab === "favoritos" ? "Favoritos" : "Todas as Senhas"}
+        </h2>
         <span class="text-xs text-gray-500 bg-surface px-2 py-1 rounded-md border border-gray-700">{filteredEntries.length} {filteredEntries.length === 1 ? "item" : "itens"}</span>
       </div>
 
@@ -459,7 +594,11 @@
         <p class="text-sm text-primary mb-4">{clipboardNotice}</p>
       {/if}
 
-      {#if entries.length === 0}
+      {#if activeTab === "favoritos" && !entries.some((entry) => entry.favorite)}
+        <div class="text-center text-gray-500 text-sm py-16 border border-dashed border-gray-800 rounded-xl">
+          Você ainda não adicionou itens aos favoritos.
+        </div>
+      {:else if entries.length === 0}
         <div class="text-center text-gray-500 text-sm py-16 border border-dashed border-gray-800 rounded-xl">
           Nenhuma senha cadastrada ainda. Clique em "Novo Item" para começar.
         </div>
@@ -479,34 +618,43 @@
 
             <div class="flex items-center gap-2 mt-4">
               <button
-                on:click={() => copiarSenha(entry)}
+                onclick={() => copiarSenha(entry)}
                 class="flex-1 text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:bg-white/5 transition-colors"
               >
                 Copiar senha
               </button>
               <button
-                on:click={() => editarItem(entry)}
+                onclick={() => toggleFavorite(entry)}
+                disabled={favoriteBusyId !== null}
+                aria-label={entry.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
+                title={entry.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
+                class="text-lg text-primary disabled:opacity-50"
+              >
+                {entry.favorite ? "★" : "☆"}
+              </button>
+              <button
+                onclick={() => editarItem(entry)}
                 class="text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:bg-white/5 transition-colors"
               >
                 Editar
               </button>
               {#if deletingId === entry.id}
                 <button
-                  on:click={() => excluirItem(entry.id)}
+                  onclick={() => excluirItem(entry.id)}
                   disabled={itemBusy}
                   class="text-xs py-1.5 px-2 rounded-lg border border-danger text-danger hover:bg-danger/10 disabled:opacity-50 transition-colors"
                 >
                   Confirmar
                 </button>
                 <button
-                  on:click={() => (deletingId = null)}
+                  onclick={() => (deletingId = null)}
                   class="text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
                 >
                   Cancelar
                 </button>
               {:else}
                 <button
-                  on:click={() => (deletingId = entry.id)}
+                  onclick={() => (deletingId = entry.id)}
                   class="text-xs py-1.5 px-2 rounded-lg border border-gray-700 text-gray-400 hover:text-danger hover:border-danger transition-colors"
                 >
                   Excluir
@@ -517,6 +665,7 @@
         {/each}
       </div>
       {/if}
+      {/if}
     </div>
   </div>
 
@@ -524,7 +673,10 @@
   <div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
     <form
       class="w-full max-w-md bg-surface p-6 rounded-xl border border-gray-800 space-y-4"
-      on:submit|preventDefault={salvarItem}
+      onsubmit={(event) => {
+        event.preventDefault();
+        void salvarItem();
+      }}
     >
       <h2 class="text-lg font-semibold text-white">{editingId ? "Editar Item" : "Novo Item"}</h2>
 
@@ -567,7 +719,7 @@
       <div class="flex justify-end gap-3 pt-2">
         <button
           type="button"
-          on:click={fecharModal}
+          onclick={fecharModal}
           class="py-2 px-4 rounded-lg text-sm text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
         >
           Cancelar

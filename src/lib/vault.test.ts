@@ -5,8 +5,11 @@ import {
   CLIPBOARD_CLEAR_MS,
   createInactivityTimer,
   filterEntries,
+  generatePassword,
   LEGACY_USERNAME,
+  MAX_GENERATED_PASSWORD_LENGTH,
   MIN_MASTER_PASSWORD_LENGTH,
+  MIN_GENERATED_PASSWORD_LENGTH,
   usernameForEditing,
   validateEntryFields,
   validateMasterPassword,
@@ -15,8 +18,8 @@ import {
 import { afterEach, vi } from "vitest";
 
 const entries: VaultEntry[] = [
-  { id: "1", domain: "Example.com", username: "Ana@Example.com", created_at: "2025-01-01" },
-  { id: "2", domain: "mail.test", username: "bia", created_at: "2025-01-02" },
+  { id: "1", domain: "Example.com", username: "Ana@Example.com", created_at: "2025-01-01", favorite: true },
+  { id: "2", domain: "mail.test", username: "bia", created_at: "2025-01-02", favorite: false },
 ];
 
 describe("clipboard timeout", () => {
@@ -112,6 +115,49 @@ describe("filterEntries", () => {
   it("returns all entries for a blank query and none for no match", () => {
     expect(filterEntries(entries, "  ")).toBe(entries);
     expect(filterEntries(entries, "missing")).toEqual([]);
+  });
+
+  it("limits results to favorites when requested", () => {
+    expect(filterEntries(entries, "", true)).toEqual([entries[0]]);
+    expect(filterEntries(entries, "mail", true)).toEqual([]);
+  });
+});
+
+describe("generatePassword", () => {
+  it("generates the requested length with at least one character from every enabled group", () => {
+    const password = generatePassword(20, {
+      uppercase: true,
+      lowercase: true,
+      numbers: true,
+      symbols: true,
+    });
+
+    expect(password).toHaveLength(20);
+    expect(password).toMatch(/[A-Z]/);
+    expect(password).toMatch(/[a-z]/);
+    expect(password).toMatch(/[0-9]/);
+    expect([...password].some((character) => "!@#$%^&*()-_=+[]{};:,.?/".includes(character))).toBe(
+      true,
+    );
+  });
+
+  it("rejects invalid lengths and an empty character selection", () => {
+    const options = { uppercase: true, lowercase: false, numbers: false, symbols: false };
+
+    expect(() => generatePassword(MIN_GENERATED_PASSWORD_LENGTH - 1, options)).toThrow(
+      RangeError,
+    );
+    expect(() => generatePassword(MAX_GENERATED_PASSWORD_LENGTH + 1, options)).toThrow(
+      RangeError,
+    );
+    expect(() =>
+      generatePassword(20, {
+        uppercase: false,
+        lowercase: false,
+        numbers: false,
+        symbols: false,
+      }),
+    ).toThrow("Selecione pelo menos um tipo de caractere.");
   });
 });
 

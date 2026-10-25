@@ -123,6 +123,16 @@ impl Database {
             println!("✅ Migration v2 concluída.");
         }
 
+        if current_version < 3 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE vault_entries
+                     ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -222,8 +232,8 @@ impl Database {
         conn.execute(
             "INSERT INTO vault_entries
              (id, domain, username_encrypted, nonce_username,
-              password_encrypted, nonce_password, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              password_encrypted, nonce_password, created_at, favorite)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 entry.id,
                 entry.domain,
@@ -231,7 +241,8 @@ impl Database {
                 nonce_username, // antes descartado como `_nonce_user` — agora persistido
                 enc_password,
                 nonce_password,
-                entry.created_at.to_rfc3339()
+                entry.created_at.to_rfc3339(),
+                entry.favorite
             ],
         )?;
 
@@ -289,6 +300,19 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_favorite(&self, id: &str, favorite: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.open_connection()?;
+        let updated = conn.execute(
+            "UPDATE vault_entries SET favorite = ?2 WHERE id = ?1",
+            params![id, favorite],
+        )?;
+
+        if updated == 0 {
+            return Err("Entrada não encontrada.".into());
+        }
+        Ok(())
+    }
+
     // ── Leitura ──────────────────────────────────────────────────────────────
 
     /// Lê e decripta todas as entradas do cofre.
@@ -306,7 +330,7 @@ impl Database {
             "SELECT id, domain,
                     username_encrypted, nonce_username,
                     password_encrypted, nonce_password,
-                    created_at
+                    created_at, favorite
              FROM vault_entries
              ORDER BY created_at DESC",
         )?;
@@ -320,6 +344,7 @@ impl Database {
                 row.get::<_, Vec<u8>>(4)?,         // password_encrypted
                 row.get::<_, Vec<u8>>(5)?,         // nonce_password
                 row.get::<_, String>(6)?,          // created_at
+                row.get::<_, bool>(7)?,            // favorite
             ))
         })?;
 
@@ -334,6 +359,7 @@ impl Database {
                 enc_password,
                 nonce_password,
                 created_at_str,
+                favorite,
             ) = raw?;
 
             // Decripta a senha — falha explícita em caso de chave errada ou corrupção
@@ -373,6 +399,7 @@ impl Database {
                 username,
                 password,
                 created_at,
+                favorite,
             });
         }
 
@@ -443,11 +470,11 @@ mod tests {
     }
 
     #[test]
-    fn banco_novo_nasce_na_versao_2_com_schema_atual() {
+    fn banco_novo_nasce_na_versao_3_com_schema_atual() {
         let (_dir, db) = migrated_db();
         let conn = db.open_connection().unwrap();
 
-        assert_eq!(schema_version(&conn), 2);
+        assert_eq!(schema_version(&conn), 3);
 
         let columns = column_names(&conn, "vault_entries");
         for expected in [
@@ -458,6 +485,7 @@ mod tests {
             "password_encrypted",
             "nonce_password",
             "created_at",
+            "favorite",
         ] {
             assert!(
                 columns.iter().any(|c| c == expected),
@@ -497,7 +525,7 @@ mod tests {
 
         Database::setup_schema(&conn).unwrap();
 
-        assert_eq!(schema_version(&conn), 2);
+        assert_eq!(schema_version(&conn), 3);
         let columns = column_names(&conn, "vault_entries");
         assert!(!columns.iter().any(|c| c == "nonce"));
         assert!(columns.iter().any(|c| c == "nonce_username"));
@@ -519,7 +547,7 @@ mod tests {
         Database::setup_schema(&conn).unwrap();
         Database::setup_schema(&conn).unwrap();
 
-        assert_eq!(schema_version(&conn), 2);
+        assert_eq!(schema_version(&conn), 3);
         assert_eq!(db.get_all_entries(&KEY).unwrap().len(), 1);
     }
 
@@ -538,6 +566,60 @@ mod tests {
         assert_eq!(stored.username, "usuario@exemplo.com");
         assert_eq!(stored.password, "senha-forte");
         assert_eq!(stored.created_at, entry.created_at);
+        assert!(!stored.favorite);
+    }
+
+    #[test]
+    fn migra_schema_v2_e_preserva_as_entradas_com_favorito_desativado() {
+        let dir = TempDir::new();
+        let db = dir.database();
+        let conn = db.open_connection().unwrap();
+        let (enc_password, nonce_password) = encrypt("senha-antiga", &KEY).unwrap();
+        let (enc_username, nonce_username) = encrypt("usuario", &KEY).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vault_entries (
+                id                 TEXT PRIMARY KEY,
+                domain             TEXT NOT NULL,
+                username_encrypted BLOB,
+                nonce_username     BLOB,
+                password_encrypted BLOB NOT NULL,
+                nonce_password     BLOB NOT NULL,
+                created_at         TEXT NOT NULL
+             );
+             CREATE TABLE vault_config (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_entries
+             (id, domain, username_encrypted, nonce_username, password_encrypted,
+              nonce_password, created_at)
+             VALUES ('v2-entry', 'antigo.com', ?1, ?2, ?3, ?4, '2024-01-01T00:00:00+00:00')",
+            params![enc_username, nonce_username, enc_password, nonce_password],
+        )
+        .unwrap();
+
+        Database::setup_schema(&conn).unwrap();
+        drop(conn);
+
+        let entries = db.get_all_entries(&KEY).unwrap();
+        assert_eq!(schema_version(&db.open_connection().unwrap()), 3);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "v2-entry");
+        assert_eq!(entries[0].password, "senha-antiga");
+        assert!(!entries[0].favorite);
+    }
+
+    #[test]
+    fn favorito_e_persistido_e_entrada_inexistente_falha() {
+        let (_dir, db) = migrated_db();
+        let entry = sample_entry("site.com");
+        db.insert_entry(&entry, &KEY).unwrap();
+
+        db.set_favorite(&entry.id, true).unwrap();
+        let entries = db.get_all_entries(&KEY).unwrap();
+        assert!(entries[0].favorite);
+        assert!(db.set_favorite("inexistente", true).is_err());
     }
 
     #[test]

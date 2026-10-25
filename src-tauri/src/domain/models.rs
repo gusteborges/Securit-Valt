@@ -10,6 +10,7 @@ pub struct VaultEntry {
     pub username: String,
     pub password: String, // Essa string será encriptada antes de salvar
     pub created_at: DateTime<Utc>,
+    pub favorite: bool,
 }
 
 impl Drop for VaultEntry {
@@ -28,6 +29,7 @@ impl VaultEntry {
             username,
             password,
             created_at: Utc::now(),
+            favorite: false,
         }
     }
 }

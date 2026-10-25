@@ -1,7 +1,7 @@
 {
   "name": "secure-vault",
   "version": "0.1.0",
-  "description": "",
+  "description": "Cofre local de senhas criptografadas.",
   "type": "module",
   "scripts": {
     "dev": "vite dev",

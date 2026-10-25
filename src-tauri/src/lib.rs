@@ -11,7 +11,7 @@ mod test_support;
 // 2. Importações
 use application::commands::{
     add_entry, delete_entry, get_password, initialize_vault, list_entries, lock_vault,
-    unlock_vault, update_entry, vault_status,
+    set_favorite, unlock_vault, update_entry, vault_status,
 };
 use security::vault_state::VaultState;
 
@@ -33,6 +33,7 @@ pub fn run() {
             get_password,
             update_entry,
             delete_entry,
+            set_favorite,
         ])
         .run(tauri::generate_context!())
         .expect("Erro ao iniciar a aplicação Tauri");

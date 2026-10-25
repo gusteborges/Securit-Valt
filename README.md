@@ -1,7 +1,27 @@
-# Tauri + SvelteKit + TypeScript
+# SecureVault
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
+Aplicativo desktop local para armazenar credenciais em um cofre criptografado.
+As senhas são criptografadas no banco local e o cofre é protegido por uma senha
+mestra.
 
-## Recommended IDE Setup
+## Desenvolvimento
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+Requisitos: Node.js, npm, Rust e as dependências de sistema do Tauri 2 para sua
+plataforma.
+
+```sh
+npm install
+npm run tauri dev
+```
+
+## Verificações
+
+```sh
+npm test
+npm run check
+npm run build
+cd src-tauri && cargo test
+```
+
+O banco do aplicativo é criado em `app_data_dir` como `securevault.db`.
+Mantenha uma cópia segura da senha mestra: ela não pode ser recuperada.

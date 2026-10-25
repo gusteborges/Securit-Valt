@@ -366,6 +366,32 @@ pub fn delete_entry(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn set_favorite(
+    id: String,
+    favorite: bool,
+    app: AppHandle,
+    state: State<VaultState>,
+) -> Result<String, String> {
+    get_db(&app)
+        .and_then(|db| set_favorite_with(&db, &state, &id, favorite))
+        .map_err(|e| e.to_string())
+}
+
+fn set_favorite_with(
+    db: &Database,
+    state: &VaultState,
+    id: &str,
+    favorite: bool,
+) -> Result<String, AppError> {
+    let _key = session_key(state)?;
+
+    db.set_favorite(id, favorite)
+        .map_err(|e| AppError::Persistence(e.to_string()))?;
+
+    Ok("Favorito atualizado.".into())
+}
+
 fn delete_entry_with(db: &Database, state: &VaultState, id: &str) -> Result<String, AppError> {
     let _key = session_key(state)?;
 
@@ -417,6 +443,7 @@ pub struct VaultEntrySummary {
     pub domain: String,
     pub username: String,
     pub created_at: String, // ISO 8601
+    pub favorite: bool,
 }
 
 impl From<&VaultEntry> for VaultEntrySummary {
@@ -426,6 +453,7 @@ impl From<&VaultEntry> for VaultEntrySummary {
             domain: e.domain.clone(),
             username: e.username.clone(),
             created_at: e.created_at.to_rfc3339(),
+            favorite: e.favorite,
         }
     }
 }
@@ -611,7 +639,28 @@ mod tests {
 
         assert_eq!(response["domain"], "site.com");
         assert_eq!(response["username"], "ana");
+        assert_eq!(response["favorite"], false);
         assert!(response.get("password").is_none());
+    }
+
+    #[test]
+    fn favorito_pode_ser_alterado_e_requer_cofre_desbloqueado() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha-site");
+        let entry = first_entry(&f);
+
+        set_favorite_with(&f.db, &f.state, &entry.id, true).unwrap();
+        assert!(first_entry(&f).favorite);
+
+        lock_vault_with(&f.state).unwrap();
+        assert!(set_favorite_with(&f.db, &f.state, &entry.id, false).is_err());
+    }
+
+    #[test]
+    fn favorito_de_entrada_inexistente_falha() {
+        let f = initialized_fixture();
+
+        assert!(set_favorite_with(&f.db, &f.state, "nao-existe", true).is_err());
     }
 
     fn password_of(f: &Fixture, id: &str) -> String {
