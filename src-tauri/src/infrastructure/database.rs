@@ -1,9 +1,10 @@
 // src-tauri/src/infrastructure/database.rs
 
-use rusqlite::{params, Connection, Result};
-use std::path::Path;
 use crate::domain::models::VaultEntry;
 use crate::security::crypto::{decrypt, encrypt, ARGON2_SALT_LEN};
+use rusqlite::{params, Connection, Result};
+use std::path::Path;
+use zeroize::Zeroize;
 
 pub struct Database {
     path: String,
@@ -33,8 +34,7 @@ impl Database {
     /// Aplica todas as migrações pendentes de forma idempotente.
     /// Usa `PRAGMA user_version` como número de versão do schema.
     pub fn setup_schema(conn: &Connection) -> Result<()> {
-        let current_version: i32 =
-            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let current_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
         // Migration v1 — tabela inicial vault_entries (schema legado, sem nonce_username)
         // Só aplicada se o banco já existia com user_version = 0 e a tabela foi criada
@@ -73,15 +73,12 @@ impl Database {
             )?;
 
             // Verifica se vault_entries já existe (banco legado com coluna 'nonce')
-            let old_col_exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('vault_entries')
+            let old_col_exists = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('vault_entries')
                      WHERE name = 'nonce'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                > 0;
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
 
             if old_col_exists {
                 // Banco legado: renomeia 'nonce' → 'nonce_password' e adiciona 'nonce_username'
@@ -132,9 +129,7 @@ impl Database {
     // ── Persistência do Salt Argon2 ──────────────────────────────────────────
 
     /// Lê o salt Argon2 do banco. Retorna `None` se o cofre nunca foi inicializado.
-    pub fn get_argon2_salt(
-        conn: &Connection,
-    ) -> Result<Option<[u8; ARGON2_SALT_LEN]>> {
+    pub fn get_argon2_salt(conn: &Connection) -> Result<Option<[u8; ARGON2_SALT_LEN]>> {
         let result = conn.query_row(
             "SELECT value FROM vault_config WHERE key = 'argon2_salt'",
             [],
@@ -143,13 +138,13 @@ impl Database {
 
         match result {
             Ok(bytes) => {
-                let arr: [u8; ARGON2_SALT_LEN] = bytes
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidColumnType(
+                let arr: [u8; ARGON2_SALT_LEN] = bytes.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
                         0,
                         "argon2_salt".into(),
                         rusqlite::types::Type::Blob,
-                    ))?;
+                    )
+                })?;
                 Ok(Some(arr))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -159,10 +154,7 @@ impl Database {
 
     /// Persiste o salt Argon2 gerado na inicialização do cofre.
     /// Deve ser chamado somente uma vez — `initialize_vault` garante isso.
-    pub fn store_argon2_salt(
-        conn: &Connection,
-        salt: &[u8; ARGON2_SALT_LEN],
-    ) -> Result<()> {
+    pub fn store_argon2_salt(conn: &Connection, salt: &[u8; ARGON2_SALT_LEN]) -> Result<()> {
         conn.execute(
             "INSERT INTO vault_config (key, value) VALUES ('argon2_salt', ?1)",
             params![salt.as_ref()],
@@ -194,7 +186,9 @@ impl Database {
 
     /// Indica se existe pelo menos uma entrada no cofre.
     pub fn has_entries(conn: &Connection) -> Result<bool> {
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM vault_entries)", [], |row| row.get(0))
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM vault_entries)", [], |row| {
+            row.get(0)
+        })
     }
 
     /// Remove salt e verificador. Só deve ser usado para recriar um cofre sem entradas.
@@ -234,7 +228,7 @@ impl Database {
                 entry.id,
                 entry.domain,
                 enc_username,
-                nonce_username,   // antes descartado como `_nonce_user` — agora persistido
+                nonce_username, // antes descartado como `_nonce_user` — agora persistido
                 enc_password,
                 nonce_password,
                 entry.created_at.to_rfc3339()
@@ -319,44 +313,59 @@ impl Database {
 
         let rows = stmt.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,        // id
-                row.get::<_, String>(1)?,        // domain
+                row.get::<_, String>(0)?,          // id
+                row.get::<_, String>(1)?,          // domain
                 row.get::<_, Option<Vec<u8>>>(2)?, // username_encrypted
                 row.get::<_, Option<Vec<u8>>>(3)?, // nonce_username
-                row.get::<_, Vec<u8>>(4)?,       // password_encrypted
-                row.get::<_, Vec<u8>>(5)?,       // nonce_password
-                row.get::<_, String>(6)?,        // created_at
+                row.get::<_, Vec<u8>>(4)?,         // password_encrypted
+                row.get::<_, Vec<u8>>(5)?,         // nonce_password
+                row.get::<_, String>(6)?,          // created_at
             ))
         })?;
 
         let mut entries = Vec::new();
 
         for raw in rows {
-            let (id, domain, enc_username, nonce_username,
-                 enc_password, nonce_password, created_at_str) = raw?;
+            let (
+                id,
+                domain,
+                enc_username,
+                nonce_username,
+                enc_password,
+                nonce_password,
+                created_at_str,
+            ) = raw?;
 
             // Decripta a senha — falha explícita em caso de chave errada ou corrupção
-            let password = decrypt(&enc_password, &nonce_password, master_key)
-                .map_err(|e| -> Box<dyn std::error::Error> {
+            let mut password = decrypt(&enc_password, &nonce_password, master_key).map_err(
+                |e| -> Box<dyn std::error::Error> {
                     format!("Erro ao decriptar senha do registro '{id}': {e}").into()
-                })?;
+                },
+            )?;
 
             // Decripta o username — degradação graciosa para registros legados
-            let username = match (enc_username, nonce_username) {
-                (Some(enc), Some(nonce)) => {
-                    decrypt(&enc, &nonce, master_key)
-                        .map_err(|e| -> Box<dyn std::error::Error> {
-                            format!("Erro ao decriptar username do registro '{id}': {e}").into()
-                        })?
-                }
+            let mut username = match (enc_username, nonce_username) {
+                (Some(enc), Some(nonce)) => match decrypt(&enc, &nonce, master_key) {
+                    Ok(username) => username,
+                    Err(error) => {
+                        password.zeroize();
+                        return Err(format!(
+                            "Erro ao decriptar username do registro '{id}': {error}"
+                        )
+                        .into());
+                    }
+                },
                 _ => "[indisponível — registro legado]".to_string(),
             };
 
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    format!("Data inválida no registro '{id}': {e}").into()
-                })?
-                .with_timezone(&chrono::Utc);
+            let created_at = match chrono::DateTime::parse_from_rfc3339(&created_at_str) {
+                Ok(created_at) => created_at.with_timezone(&chrono::Utc),
+                Err(error) => {
+                    password.zeroize();
+                    username.zeroize();
+                    return Err(format!("Data inválida no registro '{id}': {error}").into());
+                }
+            };
 
             entries.push(VaultEntry {
                 id,
@@ -564,5 +573,41 @@ mod tests {
             Some(vec![1, 2, 3])
         );
     }
-}
 
+    #[test]
+    fn has_entries_reflete_se_o_cofre_tem_registros() {
+        let (_dir, db) = migrated_db();
+        let conn = db.open_connection().unwrap();
+
+        assert!(!Database::has_entries(&conn).unwrap());
+        db.insert_entry(&sample_entry("site.com"), &KEY).unwrap();
+        assert!(Database::has_entries(&conn).unwrap());
+    }
+
+    #[test]
+    fn clear_vault_config_remove_salt_e_verificador() {
+        let (_dir, db) = migrated_db();
+        let conn = db.open_connection().unwrap();
+        Database::store_argon2_salt(&conn, &[4; ARGON2_SALT_LEN]).unwrap();
+        Database::store_password_check(&conn, &[1, 2, 3]).unwrap();
+
+        Database::clear_vault_config(&conn).unwrap();
+
+        assert!(Database::get_argon2_salt(&conn).unwrap().is_none());
+        assert!(Database::get_password_check(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_entry_password_retorna_a_senha_sem_listar_todas_as_entradas() {
+        let (_dir, db) = migrated_db();
+        let entry = sample_entry("site.com");
+        db.insert_entry(&entry, &KEY).unwrap();
+
+        assert_eq!(
+            db.get_entry_password(&entry.id, &KEY).unwrap(),
+            Some("senha-forte".to_string())
+        );
+        assert_eq!(db.get_entry_password("inexistente", &KEY).unwrap(), None);
+        assert!(db.get_entry_password(&entry.id, &OTHER_KEY).is_err());
+    }
+}

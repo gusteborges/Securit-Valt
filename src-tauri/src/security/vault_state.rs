@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use crate::security::memory::SecureKey;
+use std::sync::Mutex;
 
 /// Estado gerenciado pelo Tauri para a sessão do cofre.
 ///
@@ -25,5 +25,26 @@ impl VaultState {
             .lock()
             .expect("VaultState mutex envenenado")
             .is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VaultState;
+    use crate::security::memory::SecureKey;
+
+    #[test]
+    fn estado_novo_comeca_bloqueado() {
+        assert!(!VaultState::new().is_unlocked());
+    }
+
+    #[test]
+    fn estado_reflete_presenca_da_chave() {
+        let state = VaultState::new();
+        *state.master_key.lock().unwrap() = Some(SecureKey::new([7; 32]));
+        assert!(state.is_unlocked());
+
+        *state.master_key.lock().unwrap() = None;
+        assert!(!state.is_unlocked());
     }
 }

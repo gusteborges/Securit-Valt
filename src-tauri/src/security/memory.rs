@@ -33,3 +33,16 @@ impl Drop for SecureKey {
 //   Clone  — duplicaria material de chave na memória
 //   Copy   — mesmo problema
 //   Debug  — imprimiria a chave em saídas de debug/log
+
+#[cfg(test)]
+mod tests {
+    use super::SecureKey;
+
+    #[test]
+    fn secure_key_expoe_a_chave_por_emprestimo() {
+        let bytes = [0xA5; 32];
+        let key = SecureKey::new(bytes);
+
+        assert_eq!(key.bytes(), &bytes);
+    }
+}

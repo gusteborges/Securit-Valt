@@ -1,3 +1,4 @@
+use crate::security::memory::SecureKey;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -5,6 +6,7 @@ use aes_gcm::{
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::{rngs::OsRng, RngCore};
 use std::error::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 // ── Constantes Argon2id (parâmetros OWASP 2023 para login interativo) ────────
 // Memória: 64 MiB | Iterações: 3 | Paralelismo: 4
@@ -37,24 +39,22 @@ pub fn generate_salt() -> [u8; ARGON2_SALT_LEN] {
 /// * `salt`     — Salt aleatório de 16 bytes lido do banco (`vault_config`).
 ///
 /// # Retorno
-/// 32 bytes aptos para uso com AES-256-GCM.
-/// O chamador é responsável por zeroizar esses bytes ao terminar
-/// (use `SecureKey` para garantia automática).
+/// Chave apta para uso com AES-256-GCM, protegida por zeroização automática.
 pub fn derive_key_from_password(
     password: &str,
     salt: &[u8; ARGON2_SALT_LEN],
-) -> Result<[u8; 32], Box<dyn Error>> {
+) -> Result<SecureKey, Box<dyn Error>> {
     let params = Params::new(ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_PARALLEL, Some(32))
         .map_err(|e| format!("Argon2 — parâmetros inválidos: {e}"))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut key = [0u8; 32];
-    argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
-        .map_err(|e| format!("Argon2 — KDF falhou: {e}"))?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    if let Err(error) = argon2.hash_password_into(password.as_bytes(), salt, &mut *key) {
+        return Err(format!("Argon2 — KDF falhou: {error}").into());
+    }
 
-    Ok(key)
+    Ok(SecureKey::new(std::mem::take(&mut *key)))
 }
 
 // ── Encriptação ──────────────────────────────────────────────────────────────
@@ -87,11 +87,7 @@ pub fn encrypt(data: &str, key: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn
 ///
 /// Retorna `Err` em caso de chave errada, dados corrompidos ou plaintext não-UTF-8.
 /// A tag de autenticação GCM é verificada automaticamente pela crate `aes-gcm`.
-pub fn decrypt(
-    ciphertext: &[u8],
-    nonce: &[u8],
-    key: &[u8; 32],
-) -> Result<String, Box<dyn Error>> {
+pub fn decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<String, Box<dyn Error>> {
     let cipher = Aes256Gcm::new(key.into());
     let nonce = Nonce::from_slice(nonce);
 
@@ -99,7 +95,15 @@ pub fn decrypt(
         .decrypt(nonce, ciphertext)
         .map_err(|_| "AES-GCM — falha na decriptação (chave errada ou dados corrompidos)")?;
 
-    Ok(String::from_utf8(plaintext)?)
+    match String::from_utf8(plaintext) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(error) => {
+            let utf8_error = error.utf8_error();
+            let mut plaintext = error.into_bytes();
+            plaintext.zeroize();
+            Err(utf8_error.into())
+        }
+    }
 }
 
 // ── Verificador de senha mestra ──────────────────────────────────────────────
@@ -122,10 +126,12 @@ pub fn verify_password_check(blob: &[u8], key: &[u8; 32]) -> bool {
         return false;
     }
     let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
-    matches!(
-        decrypt(ciphertext, nonce, key),
-        Ok(plaintext) if plaintext == PASSWORD_CHECK_PLAINTEXT
-    )
+    let Ok(mut plaintext) = decrypt(ciphertext, nonce, key) else {
+        return false;
+    };
+    let verified = plaintext == PASSWORD_CHECK_PLAINTEXT;
+    plaintext.zeroize();
+    verified
 }
 
 #[cfg(test)]
@@ -192,7 +198,7 @@ mod tests {
         let k1 = derive_key_from_password("senha-mestra", &salt).unwrap();
         let k2 = derive_key_from_password("senha-mestra", &salt).unwrap();
         let k3 = derive_key_from_password("senha-mestra", &other_salt).unwrap();
-        assert_eq!(k1, k2);
-        assert_ne!(k1, k3);
+        assert_eq!(k1.bytes(), k2.bytes());
+        assert_ne!(k1.bytes(), k3.bytes());
     }
 }

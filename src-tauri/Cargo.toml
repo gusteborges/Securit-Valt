@@ -32,12 +32,8 @@ argon2 = "0.5"           # Para hash de senha
 aes-gcm = "0.10"         # Para encriptar dados
 rand = "0.8"             # Gerador de números aleatórios seguro
 zeroize = { version = "1", features = ["derive"] } # Limpeza de memória
-secrecy = { version = "0.8", features = ["serde"] } # Proteção de logs
-base64 = "0.22"
 
 # --- UTILITÁRIOS ---
 chrono = { version = "0.4", features = ["serde"] } # Para datas
 uuid = { version = "1", features = ["v4", "serde"] } # IDs únicos
-tracing = "0.1"          # Logs
-tracing-subscriber = "0.3"
-tracing-appender = "0.2"
+tauri-plugin-clipboard-manager = "2"

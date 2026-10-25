@@ -1,49 +1,51 @@
-use tauri::{AppHandle, Manager, State};
-use rusqlite::Connection;
-use crate::domain::models::VaultEntry;
+use crate::domain::{errors::AppError, models::VaultEntry};
 use crate::infrastructure::database::Database;
 use crate::security::{
-    crypto::{
-        derive_key_from_password, generate_salt, make_password_check,
-        verify_password_check,
-    },
+    crypto::{derive_key_from_password, generate_salt, make_password_check, verify_password_check},
     memory::SecureKey,
     vault_state::VaultState,
 };
+use rusqlite::Connection;
+use tauri::{AppHandle, Manager, State};
+use zeroize::Zeroize;
 
 const MIN_PASSWORD_LEN: usize = 8;
 
 /// Copia a chave da sessão. O guard do mutex é liberado antes de qualquer I/O.
-fn session_key(state: &VaultState) -> Result<[u8; 32], String> {
+fn session_key(state: &VaultState) -> Result<SecureKey, AppError> {
     let guard = state
         .master_key
         .lock()
-        .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
-    let key = *guard
-        .as_ref()
-        .ok_or("Cofre bloqueado. Desbloqueie o cofre antes de continuar.")?
-        .bytes();
-    Ok(key)
+        .map_err(|_| AppError::Internal("Estado interno corrompido (mutex envenenado)".into()))?;
+    let mut key = *guard.as_ref().ok_or(AppError::VaultLocked)?.bytes();
+    let secure_key = SecureKey::new(key);
+    key.zeroize();
+    Ok(secure_key)
 }
 
-fn validate_entry_fields(domain: &str, password: &str) -> Result<(), String> {
+fn validate_entry_fields(domain: &str, password: &str) -> Result<(), AppError> {
     if domain.trim().is_empty() || password.is_empty() {
-        return Err("Domínio e senha são obrigatórios.".into());
+        return Err(AppError::Validation(
+            "Domínio e senha são obrigatórios.".into(),
+        ));
     }
     Ok(())
 }
 
-fn get_db(app: &AppHandle) -> Result<Database, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+fn get_db(app: &AppHandle) -> Result<Database, AppError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Platform(e.to_string()))?;
+    std::fs::create_dir_all(&dir)?;
     Ok(Database::new(dir.join("securevault.db")))
 }
 
-fn validate_master_password(password: &str) -> Result<(), String> {
+fn validate_master_password(password: &str) -> Result<(), AppError> {
     if password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(format!(
+        return Err(AppError::Validation(format!(
             "A senha mestra deve ter pelo menos {MIN_PASSWORD_LEN} caracteres."
-        ));
+        )));
     }
     Ok(())
 }
@@ -55,22 +57,18 @@ fn validate_master_password(password: &str) -> Result<(), String> {
 /// Salt sem verificador e sem entradas é o resto de um cofre legado vazio: não
 /// guarda dados, então é tratado como não inicializado e recriado com a senha
 /// escolhida no setup, em vez de aceitar a primeira senha digitada no desbloqueio.
-fn vault_is_initialized(conn: &Connection) -> Result<bool, String> {
-    let has_salt = Database::get_argon2_salt(conn)
-        .map_err(|e| e.to_string())?
-        .is_some();
+fn vault_is_initialized(conn: &Connection) -> Result<bool, AppError> {
+    let has_salt = Database::get_argon2_salt(conn)?.is_some();
     if !has_salt {
         return Ok(false);
     }
 
-    let has_check = Database::get_password_check(conn)
-        .map_err(|e| e.to_string())?
-        .is_some();
+    let has_check = Database::get_password_check(conn)?.is_some();
     if has_check {
         return Ok(true);
     }
 
-    Database::has_entries(conn).map_err(|e| e.to_string())
+    Database::has_entries(conn).map_err(AppError::Database)
 }
 
 /// Inicialização do cofre (primeira execução).
@@ -81,51 +79,50 @@ fn vault_is_initialized(conn: &Connection) -> Result<bool, String> {
 /// Retorna erro se o cofre já foi inicializado.
 #[tauri::command]
 pub fn initialize_vault(
-    password: String,
+    mut password: String,
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    let db = get_db(&app)?;
-    initialize_vault_with(&db, &state, &password)
+    let result = get_db(&app).and_then(|db| initialize_vault_with(&db, &state, &password));
+    password.zeroize();
+    result.map_err(|e| e.to_string())
 }
 
 fn initialize_vault_with(
     db: &Database,
     state: &VaultState,
     password: &str,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     validate_master_password(password)?;
 
-    let mut conn = db.open_connection().map_err(|e| e.to_string())?;
+    let mut conn = db.open_connection()?;
 
-    Database::setup_schema(&conn).map_err(|e| e.to_string())?;
+    Database::setup_schema(&conn)?;
 
     // Impede dupla inicialização e nunca recria sobre entradas existentes
-    let has_entries = Database::has_entries(&conn).map_err(|e| e.to_string())?;
+    let has_entries = Database::has_entries(&conn)?;
     if vault_is_initialized(&conn)? || has_entries {
-        return Err(
-            "Cofre já inicializado. Use unlock_vault para desbloquear.".into(),
-        );
+        return Err(AppError::VaultAlreadyInitialized);
     }
 
     // Salt e verificador são gravados juntos: ou ambos existem, ou nenhum
     let salt = generate_salt();
-    let key_bytes = derive_key_from_password(&password, &salt)
-        .map_err(|e| e.to_string())?;
-    let check = make_password_check(&key_bytes).map_err(|e| e.to_string())?;
+    let key =
+        derive_key_from_password(password, &salt).map_err(|e| AppError::Crypto(e.to_string()))?;
+    let check = make_password_check(key.bytes()).map_err(|e| AppError::Crypto(e.to_string()))?;
 
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    Database::clear_vault_config(&tx).map_err(|e| e.to_string())?;
-    Database::store_argon2_salt(&tx, &salt).map_err(|e| e.to_string())?;
-    Database::store_password_check(&tx, &check).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    let tx = conn.transaction()?;
+    Database::clear_vault_config(&tx)?;
+    Database::store_argon2_salt(&tx, &salt)?;
+    Database::store_password_check(&tx, &check)?;
+    tx.commit()?;
 
     // Armazena no estado gerenciado — SecureKey zeroiza automaticamente no Drop
     let mut guard = state
         .master_key
         .lock()
-        .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
-    *guard = Some(SecureKey::new(key_bytes));
+        .map_err(|_| AppError::Internal("Estado interno corrompido (mutex envenenado)".into()))?;
+    *guard = Some(key);
 
     Ok("Cofre inicializado e desbloqueado com sucesso.".into())
 }
@@ -144,53 +141,60 @@ fn initialize_vault_with(
 /// `initialize_vault`.
 #[tauri::command]
 pub fn unlock_vault(
-    password: String,
+    mut password: String,
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    let db = get_db(&app)?;
-    unlock_vault_with(&db, &state, &password)
+    let result = get_db(&app).and_then(|db| unlock_vault_with(&db, &state, &password));
+    password.zeroize();
+    result.map_err(|e| e.to_string())
 }
 
 fn unlock_vault_with(
     db: &Database,
     state: &VaultState,
     password: &str,
-) -> Result<String, String> {
-    let conn = db.open_connection().map_err(|e| e.to_string())?;
+) -> Result<String, AppError> {
+    let conn = db.open_connection()?;
 
-    Database::setup_schema(&conn).map_err(|e| e.to_string())?;
+    Database::setup_schema(&conn)?;
 
     if !vault_is_initialized(&conn)? {
-        return Err("Cofre não inicializado. Execute initialize_vault primeiro.".into());
+        return Err(AppError::VaultNotInitialized);
     }
 
     let salt = Database::get_argon2_salt(&conn)
-        .map_err(|e| e.to_string())?
-        .ok_or("Cofre não inicializado. Execute initialize_vault primeiro.")?;
+        .map_err(AppError::Database)?
+        .ok_or(AppError::VaultNotInitialized)?;
 
-    let key_bytes = derive_key_from_password(&password, &salt)
-        .map_err(|e| e.to_string())?;
+    let key =
+        derive_key_from_password(password, &salt).map_err(|e| AppError::Crypto(e.to_string()))?;
 
-    match Database::get_password_check(&conn).map_err(|e| e.to_string())? {
+    match Database::get_password_check(&conn)? {
         Some(blob) => {
-            if !verify_password_check(&blob, &key_bytes) {
-                return Err("Senha mestra incorreta.".into());
+            if !verify_password_check(&blob, key.bytes()) {
+                return Err(AppError::IncorrectMasterPassword);
             }
         }
         None => {
-            db.get_all_entries(&key_bytes)
-                .map_err(|_| "Senha mestra incorreta.".to_string())?;
-            let check = make_password_check(&key_bytes).map_err(|e| e.to_string())?;
-            Database::store_password_check(&conn, &check).map_err(|e| e.to_string())?;
+            let mut entries = db
+                .get_all_entries(key.bytes())
+                .map_err(|_| AppError::IncorrectMasterPassword)?;
+            for entry in &mut entries {
+                entry.password.zeroize();
+                entry.username.zeroize();
+            }
+            let check =
+                make_password_check(key.bytes()).map_err(|e| AppError::Crypto(e.to_string()))?;
+            Database::store_password_check(&conn, &check)?;
         }
     }
 
     let mut guard = state
         .master_key
         .lock()
-        .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
-    *guard = Some(SecureKey::new(key_bytes));
+        .map_err(|_| AppError::Internal("Estado interno corrompido (mutex envenenado)".into()))?;
+    *guard = Some(key);
 
     Ok("Cofre desbloqueado.".into())
 }
@@ -204,28 +208,35 @@ fn unlock_vault_with(
 #[tauri::command]
 pub fn add_entry(
     domain: String,
-    username: String,
-    password: String,
+    mut username: String,
+    mut password: String,
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    let db = get_db(&app)?;
-    add_entry_with(&db, &state, domain, username, password)
+    let result =
+        get_db(&app).and_then(|db| add_entry_with(&db, &state, &domain, &username, &password));
+    username.zeroize();
+    password.zeroize();
+    result.map_err(|e| e.to_string())
 }
 
 fn add_entry_with(
     db: &Database,
     state: &VaultState,
-    domain: String,
-    username: String,
-    password: String,
-) -> Result<String, String> {
-    validate_entry_fields(&domain, &password)?;
-    let key_bytes = session_key(state)?;
+    domain: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, AppError> {
+    validate_entry_fields(domain, password)?;
+    let key = session_key(state)?;
 
-    let entry = VaultEntry::new(domain, username, password);
-    db.insert_entry(&entry, &key_bytes)
-        .map_err(|e| e.to_string())?;
+    let entry = VaultEntry::new(
+        domain.to_string(),
+        username.to_string(),
+        password.to_string(),
+    );
+    db.insert_entry(&entry, key.bytes())
+        .map_err(|e| AppError::Persistence(e.to_string()))?;
 
     Ok(format!("Entrada salva com ID: {}", entry.id))
 }
@@ -241,21 +252,22 @@ pub fn list_entries(
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<Vec<VaultEntrySummary>, String> {
-    let db = get_db(&app)?;
-    list_entries_with(&db, &state)
+    get_db(&app)
+        .and_then(|db| list_entries_with(&db, &state))
+        .map_err(|e| e.to_string())
 }
 
 fn list_entries_with(
     db: &Database,
     state: &VaultState,
-) -> Result<Vec<VaultEntrySummary>, String> {
-    let key_bytes = session_key(state)?;
+) -> Result<Vec<VaultEntrySummary>, AppError> {
+    let key = session_key(state)?;
 
     let entries = db
-        .get_all_entries(&key_bytes)
-        .map_err(|e| e.to_string())?;
+        .get_all_entries(key.bytes())
+        .map_err(|e| AppError::Persistence(e.to_string()))?;
 
-    Ok(entries.into_iter().map(VaultEntrySummary::from).collect())
+    Ok(entries.iter().map(VaultEntrySummary::from).collect())
 }
 
 // ── Comando 4b: get_password ─────────────────────────────────────────────────
@@ -269,16 +281,17 @@ pub fn get_password(
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    let db = get_db(&app)?;
-    get_password_with(&db, &state, &id)
+    get_db(&app)
+        .and_then(|db| get_password_with(&db, &state, &id))
+        .map_err(|e| e.to_string())
 }
 
-fn get_password_with(db: &Database, state: &VaultState, id: &str) -> Result<String, String> {
-    let key_bytes = session_key(state)?;
+fn get_password_with(db: &Database, state: &VaultState, id: &str) -> Result<String, AppError> {
+    let key = session_key(state)?;
 
-    db.get_entry_password(id, &key_bytes)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Entrada não encontrada.".to_string())
+    db.get_entry_password(id, key.bytes())
+        .map_err(|e| AppError::Persistence(e.to_string()))?
+        .ok_or(AppError::EntryNotFound)
 }
 
 // ── Comando 5: lock_vault ────────────────────────────────────────────────────
@@ -286,14 +299,14 @@ fn get_password_with(db: &Database, state: &VaultState, id: &str) -> Result<Stri
 /// Bloqueia o cofre: descarta a chave mestra da memória (zeroizada pelo `Drop`).
 #[tauri::command]
 pub fn lock_vault(state: State<VaultState>) -> Result<String, String> {
-    lock_vault_with(&state)
+    lock_vault_with(&state).map_err(|e| e.to_string())
 }
 
-fn lock_vault_with(state: &VaultState) -> Result<String, String> {
+fn lock_vault_with(state: &VaultState) -> Result<String, AppError> {
     let mut guard = state
         .master_key
         .lock()
-        .map_err(|_| "Estado interno corrompido (mutex envenenado)")?;
+        .map_err(|_| AppError::Internal("Estado interno corrompido (mutex envenenado)".into()))?;
     *guard = None;
 
     Ok("Cofre bloqueado.".into())
@@ -308,13 +321,16 @@ fn lock_vault_with(state: &VaultState) -> Result<String, String> {
 pub fn update_entry(
     id: String,
     domain: String,
-    username: String,
-    password: String,
+    mut username: String,
+    mut password: String,
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    let db = get_db(&app)?;
-    update_entry_with(&db, &state, &id, &domain, &username, &password)
+    let result = get_db(&app)
+        .and_then(|db| update_entry_with(&db, &state, &id, &domain, &username, &password));
+    username.zeroize();
+    password.zeroize();
+    result.map_err(|e| e.to_string())
 }
 
 fn update_entry_with(
@@ -324,12 +340,12 @@ fn update_entry_with(
     domain: &str,
     username: &str,
     password: &str,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     validate_entry_fields(domain, password)?;
-    let key_bytes = session_key(state)?;
+    let key = session_key(state)?;
 
-    db.update_entry(id, domain, username, password, &key_bytes)
-        .map_err(|e| e.to_string())?;
+    db.update_entry(id, domain, username, password, key.bytes())
+        .map_err(|e| AppError::Persistence(e.to_string()))?;
 
     Ok("Entrada atualizada.".into())
 }
@@ -345,14 +361,16 @@ pub fn delete_entry(
     app: AppHandle,
     state: State<VaultState>,
 ) -> Result<String, String> {
-    let db = get_db(&app)?;
-    delete_entry_with(&db, &state, &id)
+    get_db(&app)
+        .and_then(|db| delete_entry_with(&db, &state, &id))
+        .map_err(|e| e.to_string())
 }
 
-fn delete_entry_with(db: &Database, state: &VaultState, id: &str) -> Result<String, String> {
-    session_key(state)?;
+fn delete_entry_with(db: &Database, state: &VaultState, id: &str) -> Result<String, AppError> {
+    let _key = session_key(state)?;
 
-    db.delete_entry(id).map_err(|e| e.to_string())?;
+    db.delete_entry(id)
+        .map_err(|e| AppError::Persistence(e.to_string()))?;
 
     Ok("Entrada removida.".into())
 }
@@ -361,18 +379,16 @@ fn delete_entry_with(db: &Database, state: &VaultState, id: &str) -> Result<Stri
 
 /// Informa se o cofre já foi inicializado e se está desbloqueado nesta sessão.
 #[tauri::command]
-pub fn vault_status(
-    app: AppHandle,
-    state: State<VaultState>,
-) -> Result<VaultStatus, String> {
-    let db = get_db(&app)?;
-    vault_status_with(&db, &state)
+pub fn vault_status(app: AppHandle, state: State<VaultState>) -> Result<VaultStatus, String> {
+    get_db(&app)
+        .and_then(|db| vault_status_with(&db, &state))
+        .map_err(|e| e.to_string())
 }
 
-fn vault_status_with(db: &Database, state: &VaultState) -> Result<VaultStatus, String> {
-    let conn = db.open_connection().map_err(|e| e.to_string())?;
+fn vault_status_with(db: &Database, state: &VaultState) -> Result<VaultStatus, AppError> {
+    let conn = db.open_connection()?;
 
-    Database::setup_schema(&conn).map_err(|e| e.to_string())?;
+    Database::setup_schema(&conn)?;
 
     let initialized = vault_is_initialized(&conn)?;
 
@@ -403,12 +419,12 @@ pub struct VaultEntrySummary {
     pub created_at: String, // ISO 8601
 }
 
-impl From<VaultEntry> for VaultEntrySummary {
-    fn from(e: VaultEntry) -> Self {
+impl From<&VaultEntry> for VaultEntrySummary {
+    fn from(e: &VaultEntry) -> Self {
         Self {
-            id: e.id,
-            domain: e.domain,
-            username: e.username,
+            id: e.id.clone(),
+            domain: e.domain.clone(),
+            username: e.username.clone(),
             created_at: e.created_at.to_rfc3339(),
         }
     }
@@ -445,14 +461,7 @@ mod tests {
     }
 
     fn add(f: &Fixture, domain: &str, username: &str, password: &str) {
-        add_entry_with(
-            &f.db,
-            &f.state,
-            domain.into(),
-            username.into(),
-            password.into(),
-        )
-        .unwrap();
+        add_entry_with(&f.db, &f.state, domain, username, password).unwrap();
     }
 
     fn password_check_stored(db: &Database) -> Option<Vec<u8>> {
@@ -479,6 +488,10 @@ mod tests {
     fn senha_curta_nao_cria_cofre() {
         let f = fixture();
 
+        assert!(matches!(
+            validate_master_password("curta"),
+            Err(AppError::Validation(_))
+        ));
         assert!(initialize_vault_with(&f.db, &f.state, "curta").is_err());
 
         let status = vault_status_with(&f.db, &f.state).unwrap();
@@ -502,14 +515,10 @@ mod tests {
         let status = vault_status_with(&f.db, &f.state).unwrap();
         assert!(status.initialized);
         assert!(!status.unlocked);
-        assert!(add_entry_with(
-            &f.db,
-            &f.state,
-            "site.com".into(),
-            "usuario".into(),
-            "senha".into(),
-        )
-        .is_err());
+        assert!(matches!(
+            add_entry_with(&f.db, &f.state, "site.com", "usuario", "senha"),
+            Err(AppError::VaultLocked)
+        ));
         assert!(list_entries_with(&f.db, &f.state).is_err());
     }
 
@@ -592,6 +601,19 @@ mod tests {
         list_entries_with(&f.db, &f.state).unwrap().remove(0)
     }
 
+    #[test]
+    fn listagem_serializa_metadados_sem_campo_de_senha() {
+        let f = initialized_fixture();
+        add(&f, "site.com", "ana", "senha-secreta");
+        let entry = first_entry(&f);
+
+        let response = serde_json::to_value(entry).unwrap();
+
+        assert_eq!(response["domain"], "site.com");
+        assert_eq!(response["username"], "ana");
+        assert!(response.get("password").is_none());
+    }
+
     fn password_of(f: &Fixture, id: &str) -> String {
         get_password_with(&f.db, &f.state, id).unwrap()
     }
@@ -647,7 +669,10 @@ mod tests {
     fn get_password_entrada_inexistente_falha() {
         let f = initialized_fixture();
 
-        assert!(get_password_with(&f.db, &f.state, "nao-existe").is_err());
+        assert!(matches!(
+            get_password_with(&f.db, &f.state, "nao-existe"),
+            Err(AppError::EntryNotFound)
+        ));
     }
 
     #[test]

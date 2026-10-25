@@ -2,20 +2,27 @@
   import "../routes/app.css"; 
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-
-  interface VaultEntry {
-    id: string;
-    domain: string;
-    username: string;
-    created_at: string;
-  }
+  import {
+    clear as clearSystemClipboard,
+    writeSecret,
+  } from "@tauri-apps/plugin-clipboard-manager";
+  import {
+    AUTO_LOCK_MS,
+    clearClipboard,
+    CLIPBOARD_CLEAR_MS,
+    createInactivityTimer,
+    filterEntries,
+    usernameForEditing,
+    MIN_MASTER_PASSWORD_LENGTH,
+    validateEntryFields,
+    validateMasterPassword,
+    type VaultEntry,
+  } from "$lib/vault";
 
   interface VaultStatus {
     initialized: boolean;
     unlocked: boolean;
   }
-
-  const MIN_PASSWORD_LEN = 8;
 
   let status: "loading" | "setup" | "locked" | "unlocked" = "loading";
   let activeTab = "cofre";
@@ -40,16 +47,19 @@
   let searchQuery = "";
 
   // Edição e exclusão de entradas
-  const LEGACY_USERNAME = "[indisponível — registro legado]";
   let editingId: string | null = null;
   let deletingId: string | null = null;
   let itemBusy = false;
 
   // Copiar senha com limpeza automática da área de transferência
-  const CLIPBOARD_CLEAR_MS = 30_000;
   let clipboardTimer: ReturnType<typeof setTimeout> | null = null;
   let clipboardValue = "";
   let clipboardNotice = "";
+  let lastActivityAt = 0;
+  let lockInProgress = false;
+  const inactivityTimer = createInactivityTimer(() => {
+    void lockVault(true);
+  }, AUTO_LOCK_MS);
 
   $: filteredEntries = filterEntries(entries, searchQuery);
 
@@ -79,6 +89,8 @@
     confirmPassword = "";
     authError = "";
     status = "unlocked";
+    lastActivityAt = Date.now();
+    inactivityTimer.reset();
     await loadEntries();
   }
 
@@ -93,12 +105,9 @@
 
   async function initializeVault() {
     authError = "";
-    if (masterPassword.length < MIN_PASSWORD_LEN) {
-      authError = `A senha mestra deve ter pelo menos ${MIN_PASSWORD_LEN} caracteres.`;
-      return;
-    }
-    if (masterPassword !== confirmPassword) {
-      authError = "As senhas não coincidem.";
+    const validationError = validateMasterPassword(masterPassword, confirmPassword);
+    if (validationError) {
+      authError = validationError;
       return;
     }
 
@@ -126,14 +135,19 @@
     }
   }
 
-  async function lockVault() {
+  async function lockVault(automatic = false) {
+    if (lockInProgress) return;
+    lockInProgress = true;
     try {
       await invoke("lock_vault");
     } catch (e) {
       listError = errorMessage(e);
+      lockInProgress = false;
+      if (status === "unlocked") recordActivity();
       return;
     }
-    await limparClipboard();
+    inactivityTimer.cancel();
+    const clipboardCleared = await limparClipboard();
     entries = [];
     modalOpen = false;
     editingId = null;
@@ -141,8 +155,12 @@
     searchQuery = "";
     masterPassword = "";
     confirmPassword = "";
-    authError = "";
+    authError = automatic ? "Cofre bloqueado após cinco minutos sem atividade." : "";
+    if (!clipboardCleared) {
+      authError = "Cofre bloqueado, mas não foi possível limpar a área de transferência. Verifique as permissões do sistema.";
+    }
     status = "locked";
+    lockInProgress = false;
   }
 
   function novoItem() {
@@ -165,7 +183,7 @@
     }
     editingId = entry.id;
     newDomain = entry.domain;
-    newUsername = entry.username === LEGACY_USERNAME ? "" : entry.username;
+    newUsername = usernameForEditing(entry.username);
     newPassword = senha;
     modalError = "";
     modalOpen = true;
@@ -177,51 +195,67 @@
     newPassword = "";
   }
 
-  function filterEntries(list: VaultEntry[], query: string): VaultEntry[] {
-    const q = query.trim().toLowerCase();
-    if (!q) return list;
-    return list.filter(
-      (e) => e.domain.toLowerCase().includes(q) || e.username.toLowerCase().includes(q),
-    );
-  }
-
   async function copiarSenha(entry: VaultEntry) {
     let senha: string;
     try {
       senha = await invoke<string>("get_password", { id: entry.id });
-      await navigator.clipboard.writeText(senha);
+      await writeSecret(senha);
     } catch {
       clipboardNotice = "Não foi possível copiar a senha.";
       return;
     }
     clipboardValue = senha;
-    clipboardNotice = `Senha de ${entry.domain} copiada. A área de transferência será limpa em 30 segundos.`;
+    clipboardNotice = "Senha copiada. A área de transferência será limpa após 15 segundos.";
     if (clipboardTimer) clearTimeout(clipboardTimer);
     clipboardTimer = setTimeout(limparClipboard, CLIPBOARD_CLEAR_MS);
   }
 
-  async function limparClipboard() {
+  async function limparClipboard(): Promise<boolean> {
     if (clipboardTimer) clearTimeout(clipboardTimer);
     clipboardTimer = null;
-    if (!clipboardValue) return;
-    const copiado = clipboardValue;
-    clipboardValue = "";
-    clipboardNotice = "";
-    let atual: string | null = null;
+    if (!clipboardValue) return true;
     try {
-      atual = await navigator.clipboard.readText();
-    } catch {
-      // Sem permissão de leitura: limpa mesmo assim, para não deixar a senha exposta.
+      await clearClipboard(clearSystemClipboard);
+      clipboardValue = "";
+      clipboardNotice = "Área de transferência limpa.";
+      if (status === "locked" && authError.startsWith("Cofre bloqueado, mas não foi possível limpar")) {
+        authError = "Área de transferência limpa.";
+      }
+      return true;
+    } catch (e) {
+      clipboardNotice = `Não foi possível limpar a área de transferência: ${errorMessage(e)}`;
+      return false;
     }
-    if (atual === null || atual === copiado) {
-      await navigator.clipboard.writeText("").catch(() => {});
+  }
+
+  function recordActivity() {
+    if (status !== "unlocked") return;
+    if (lastActivityAt > 0 && Date.now() - lastActivityAt >= AUTO_LOCK_MS) {
+      void lockVault(true);
+      return;
+    }
+    lastActivityAt = Date.now();
+    inactivityTimer.reset();
+  }
+
+  function retryClipboardClear() {
+    if (clipboardValue && !clipboardTimer && document.visibilityState === "visible") {
+      void limparClipboard();
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState === "visible") {
+      recordActivity();
+      retryClipboardClear();
     }
   }
 
   async function salvarItem() {
     modalError = "";
-    if (!newDomain.trim() || !newPassword) {
-      modalError = "Domínio e senha são obrigatórios.";
+    const validationError = validateEntryFields(newDomain, newPassword);
+    if (validationError) {
+      modalError = validationError;
       return;
     }
 
@@ -260,7 +294,28 @@
   }
 
   onMount(() => {
+    const activityEvents: (keyof WindowEventMap)[] = [
+      "pointerdown",
+      "pointermove",
+      "keydown",
+      "wheel",
+      "touchstart",
+    ];
+    activityEvents.forEach((event) => window.addEventListener(event, recordActivity));
+    window.addEventListener("focus", recordActivity);
+    window.addEventListener("focus", retryClipboardClear);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     checkStatus();
+
+    return () => {
+      inactivityTimer.cancel();
+      activityEvents.forEach((event) => window.removeEventListener(event, recordActivity));
+      window.removeEventListener("focus", recordActivity);
+      window.removeEventListener("focus", retryClipboardClear);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (clipboardTimer) clearTimeout(clipboardTimer);
+      void limparClipboard();
+    };
   });
 </script>
 
@@ -302,12 +357,16 @@
         class="w-full bg-bg border border-gray-700 text-sm rounded-lg py-2 px-3 focus:outline-none focus:border-primary text-gray-200 placeholder-gray-600"
       />
       <p class="text-xs text-gray-500">
-        Mínimo de {MIN_PASSWORD_LEN} caracteres. Essa senha não pode ser recuperada.
+        Mínimo de {MIN_MASTER_PASSWORD_LENGTH} caracteres. Essa senha não pode ser recuperada.
       </p>
     {/if}
 
     {#if authError}
       <p class="text-sm text-danger">{authError}</p>
+    {/if}
+
+    {#if clipboardNotice}
+      <p class="text-sm {clipboardNotice.startsWith('Não foi possível') ? 'text-danger' : 'text-primary'}">{clipboardNotice}</p>
     {/if}
 
     <button
@@ -356,7 +415,7 @@
 
     <div class="p-4 border-t border-gray-800">
       <button
-        on:click={lockVault}
+        on:click={() => lockVault()}
         class="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-500 hover:text-danger transition-colors"
       >
         <span>🚪</span> Bloquear Cofre

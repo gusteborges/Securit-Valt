@@ -1,10 +1,10 @@
 // src-tauri/src/lib.rs
 
 // 1. Declaração dos módulos
+mod application;
 mod domain;
 mod infrastructure;
 mod security;
-mod application;
 #[cfg(test)]
 mod test_support;
 
@@ -19,6 +19,7 @@ use security::vault_state::VaultState;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         // 3. Registra o estado gerenciado (chave mestra em memória para a sessão)
         .manage(VaultState::new())
         // 4. Registra os comandos disponíveis para o frontend
