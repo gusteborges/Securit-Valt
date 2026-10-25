@@ -1,3 +1,7 @@
 {
-  "svelte.enable-ts-plugin": true
+  "svelte.enable-ts-plugin": true,
+  "chat.tools.terminal.autoApprove": {
+    "git stash": true,
+    "test": true
+  }
 }
